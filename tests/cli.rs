@@ -23,6 +23,7 @@ fn help_explains_agent_workflow_and_json_contract() {
     for expected in [
         "kompass --format json PATH > before.json",
         "kompass --format json PATH > after.json",
+        "kompass diff before.json after.json",
         "behavior-preserving refactor",
         "score comparison cannot",
         "summary.burden.production",
@@ -32,6 +33,8 @@ fn help_explains_agent_workflow_and_json_contract() {
         "files[].functions[].metrics",
         "macro_opacity.invocations",
         "macro_opacity.source_tokens",
+        "macro_opacity.definitions",
+        "macro_opacity.definition_tokens",
         "without expansion, including built-in macros",
         "Production and test",
         "scored and summarized separately",
@@ -86,7 +89,7 @@ fn json_report_contains_separate_categories_and_tokens() {
         .unwrap();
     assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["model"], "structural-v3");
+    assert_eq!(report["model"], "structural-v4");
     assert_eq!(report["summary"]["production"]["functions"], 1);
     assert_eq!(report["summary"]["test"]["functions"], 1);
     assert_eq!(report["files"][0]["functions"][0]["category"], "production");
@@ -167,7 +170,7 @@ fn reports_expression_operation_units_in_json() {
         .unwrap();
     assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["model"], "structural-v3");
+    assert_eq!(report["model"], "structural-v4");
     let function = &report["files"][0]["functions"][0];
     assert_eq!(function["metrics"]["expression_operations"], 2);
     assert_eq!(function["score"]["expression_operation_units"], 2);
@@ -193,10 +196,214 @@ fn text_shows_the_exact_operation_breakdown() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("Kompass 0.1.0 · Rust structural complexity · structural-v3"));
+    assert!(text.contains("Kompass 0.1.0 · Rust structural complexity · structural-v4"));
     assert!(text.contains(
         "score: 1.4 = 1.0 boundary + 0.0 control decisions + 0.0 nesting + 0.0 boolean operators + 0.2 expression operations + 0.0 call sites + 0.2 explicit parameters + 0.0 match arms"
     ));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn diff_reports_show_function_groups_burden_components_and_opacity() {
+    let root = temporary_directory("diff");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = root.join("main.rs");
+    let before_path = root.join("before.json");
+    let after_path = root.join("after.json");
+    std::fs::write(
+        &source,
+        "fn stable(value: bool) { if value {} }\nfn removed() {}\n",
+    )
+    .unwrap();
+
+    let before = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args(["--format", "json", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(before.status.success());
+    std::fs::write(&before_path, &before.stdout).unwrap();
+
+    std::fs::write(
+        &source,
+        "fn stable(value: bool) { if value { if value {} } }\nfn added() {}\n",
+    )
+    .unwrap();
+    let after = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args(["--format", "json", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(after.status.success());
+    std::fs::write(&after_path, &after.stdout).unwrap();
+
+    let comparison = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args([
+            "diff",
+            before_path.to_str().unwrap(),
+            after_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(comparison.status.success());
+    let text = String::from_utf8_lossy(&comparison.stdout);
+    for expected in [
+        "Production burden",
+        "Changed callables · 1",
+        "Added callables · 1",
+        "Removed callables · 1",
+        "stable",
+        "added",
+        "removed",
+        "Top score component deltas",
+        "Macro opacity",
+        "Callable summary deltas",
+        "File burden deltas",
+    ] {
+        assert!(
+            text.contains(expected),
+            "diff is missing {expected:?}\n{text}"
+        );
+    }
+
+    let json = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args([
+            "diff",
+            "--format",
+            "json",
+            before_path.to_str().unwrap(),
+            after_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["comparable"], true);
+    assert_eq!(report["functions"]["changed"].as_array().unwrap().len(), 1);
+    assert_eq!(report["functions"]["added"].as_array().unwrap().len(), 1);
+    assert_eq!(report["functions"]["removed"].as_array().unwrap().len(), 1);
+    assert!(report["callables"]["production"]["p95_score"].is_object());
+    assert_eq!(report["file_burdens"].as_array().unwrap().len(), 1);
+    assert_eq!(report["macro_opacity"]["invocations"]["delta"], 0);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn diff_rejects_model_and_coverage_mismatches() {
+    let root = temporary_directory("diff-validation");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("main.rs"), "fn stable() {}\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args(["--format", "json", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let mut report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let original_model = report["model"].clone();
+
+    let before_path = root.join("before.json");
+    let model_mismatch_path = root.join("model-mismatch.json");
+    std::fs::write(&before_path, &output.stdout).unwrap();
+    report["model"] = serde_json::Value::String("other-model".to_owned());
+    std::fs::write(
+        &model_mismatch_path,
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    let mismatch = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args([
+            "diff",
+            before_path.to_str().unwrap(),
+            model_mismatch_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(mismatch.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&mismatch.stderr);
+    assert!(stderr.contains("score model differs"), "{stderr}");
+
+    report["model"] = original_model;
+    report["coverage"]["complete"] = serde_json::Value::Bool(false);
+    let incomplete_path = root.join("incomplete.json");
+    std::fs::write(
+        &incomplete_path,
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    let incomplete = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args([
+            "diff",
+            before_path.to_str().unwrap(),
+            incomplete_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(incomplete.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&incomplete.stderr);
+    assert!(stderr.contains("after coverage is incomplete"), "{stderr}");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn diff_requires_opt_in_for_file_changes_and_highlights_scope_delta() {
+    let root = temporary_directory("diff-file-scope");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("main.rs"), "fn stable() {}\n").unwrap();
+
+    let before = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args(["--format", "json", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(before.status.success());
+    let before_path = root.join("before.json");
+    std::fs::write(&before_path, &before.stdout).unwrap();
+
+    std::fs::write(root.join("new.rs"), "fn added_file() {}\n").unwrap();
+    let after = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args(["--format", "json", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(after.status.success());
+    let after_path = root.join("after.json");
+    std::fs::write(&after_path, &after.stdout).unwrap();
+
+    let strict = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args([
+            "diff",
+            before_path.to_str().unwrap(),
+            after_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(strict.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(stderr.contains("file scope differs"), "{stderr}");
+    assert!(stderr.contains("--allow-file-changes"), "{stderr}");
+
+    let allowed = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args([
+            "diff",
+            "--allow-file-changes",
+            before_path.to_str().unwrap(),
+            after_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(allowed.status.success());
+    let text = String::from_utf8_lossy(&allowed.stdout);
+    for expected in [
+        "WARNING: file set changed",
+        "Added files · 1",
+        "new.rs",
+        "aggregate burden and component deltas include added and removed files",
+    ] {
+        assert!(
+            text.contains(expected),
+            "diff is missing {expected:?}\n{text}"
+        );
+    }
 
     std::fs::remove_dir_all(root).unwrap();
 }

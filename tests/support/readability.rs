@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+
 use kompass::{score, tokens};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -42,7 +44,7 @@ pub fn function_snapshot(source: &str, name: &str) -> Snapshot {
 pub fn aggregate_snapshot(source: &str) -> Snapshot {
     let syntax = syn::parse_file(source).expect("aggregate readability fixture should parse");
     let lexed = tokens::lex(source).expect("aggregate readability fixture should lex");
-    let mut collector = CallableCollector::default();
+    let mut collector = CallableCollector::new(&syntax);
     collector.visit_file(&syntax);
 
     snapshot_for_callable_metrics(collector.metrics, lexed.total_tokens())
@@ -53,7 +55,7 @@ pub fn aggregate_snapshot(source: &str) -> Snapshot {
 /// while still charging extracted helpers and closures in aggregate scope.
 pub fn selected_snapshot(source: &str, names: &[&str]) -> Snapshot {
     let syntax = syn::parse_file(source).expect("selected readability fixture should parse");
-    let mut collector = CallableCollector::default();
+    let mut collector = CallableCollector::new(&syntax);
     let mut selected_tokens: usize = 0;
     for item in &syntax.items {
         let Item::Fn(item) = item else {
@@ -129,9 +131,22 @@ fn snapshot_for_callable_metrics(metrics: Vec<kompass::model::Metrics>, tokens: 
     aggregate
 }
 
-#[derive(Default)]
 struct CallableCollector {
     metrics: Vec<kompass::model::Metrics>,
+    closure_depths: BTreeMap<(tokens::TokenPosition, tokens::TokenPosition), usize>,
+}
+
+impl CallableCollector {
+    fn new(syntax: &syn::File) -> Self {
+        let closure_depths = score::closure_base_depths(syntax)
+            .into_iter()
+            .map(|closure| ((closure.start, closure.end), closure.depth))
+            .collect();
+        Self {
+            metrics: Vec::new(),
+            closure_depths,
+        }
+    }
 }
 
 impl<'ast> Visit<'ast> for CallableCollector {
@@ -146,8 +161,26 @@ impl<'ast> Visit<'ast> for CallableCollector {
     }
 
     fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
-        self.metrics
-            .push(score::measure_closure(&node.body, 0, node.inputs.len()));
+        let span = node.span();
+        let start = span.start();
+        let end = span.end();
+        let key = (
+            tokens::TokenPosition {
+                line: start.line,
+                column: start.column,
+            },
+            tokens::TokenPosition {
+                line: end.line,
+                column: end.column,
+            },
+        );
+        let base_depth = self.closure_depths.get(&key).copied().unwrap_or(0);
+        self.metrics.push(score::measure_closure_at_depth(
+            &node.body,
+            0,
+            node.inputs.len(),
+            base_depth,
+        ));
         visit::visit_expr_closure(self, node);
     }
 }

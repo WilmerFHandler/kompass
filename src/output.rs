@@ -66,8 +66,11 @@ fn render_text(report: &Report, top: usize, tests: bool, all: bool, sort: SortBy
     .unwrap();
     writeln!(
         output,
-        "Macro opacity · {} source invocations · {} source tokens · unexpanded and excluded from score",
-        report.macro_opacity.invocations, report.macro_opacity.source_tokens
+        "Macro opacity · {} source invocations · {} invocation source tokens · {} definitions · {} definition tokens · unexpanded and excluded from score",
+        report.macro_opacity.invocations,
+        report.macro_opacity.source_tokens,
+        report.macro_opacity.definitions,
+        report.macro_opacity.definition_tokens
     )
     .unwrap();
     render_file_burdens(&mut output, report, top);
@@ -128,7 +131,7 @@ fn render_text(report: &Report, top: usize, tests: bool, all: bool, sort: SortBy
         output.push('\n');
         writeln!(
             output,
-            "No {} functions found in the analyzed Rust files.",
+            "No {} callables found in the analyzed Rust files.",
             if all {
                 "production or test"
             } else if tests {
@@ -181,13 +184,13 @@ fn compare_functions(
 fn ranking_heading(category: Category, sort: SortBy) -> String {
     if sort == SortBy::Score {
         format!(
-            "Most complex {} functions · sorted by {}",
+            "Most complex {} callables · sorted by {}",
             category_label(category),
             sort.label()
         )
     } else {
         format!(
-            "{} functions · sorted by {}",
+            "{} callables · sorted by {}",
             category_label(category),
             sort.label()
         )
@@ -197,7 +200,7 @@ fn ranking_heading(category: Category, sort: SortBy) -> String {
 fn render_category_summary(output: &mut String, label: &str, summary: &CategorySummary) {
     writeln!(
         output,
-        "{label} · {} functions · total burden {} · average {} · p95 {} · highest {}",
+        "{label} · {} callables · total burden {} · average {} · p95 {} · highest {}",
         summary.functions,
         format_score(summary.total_score),
         format_average(summary.average_score),
@@ -406,7 +409,7 @@ mod tests {
 
         let text =
             render_report(&report, OutputFormat::Text, 10, false, false, SortBy::Score).unwrap();
-        assert!(text.contains("Most complex production functions"));
+        assert!(text.contains("Most complex production callables"));
         assert!(text.contains("sorted by score"));
         assert!(text.contains("12 Tokens"));
         assert!(text.contains("score: 5.0 ="));
@@ -484,13 +487,13 @@ mod tests {
 
         let depth =
             render_report(&report, OutputFormat::Text, 3, false, false, SortBy::Depth).unwrap();
-        assert!(depth.contains("production functions · sorted by depth"));
+        assert!(depth.contains("production callables · sorted by depth"));
         assert!(depth.find("a.rs:1:1  beta") < depth.find("a.rs:1:1  alpha"));
         assert!(depth.find("a.rs:1:1  alpha") < depth.find("z.rs:1:1  zeta"));
 
         let size =
             render_report(&report, OutputFormat::Text, 3, false, false, SortBy::Size).unwrap();
-        assert!(size.contains("production functions · sorted by size"));
+        assert!(size.contains("production callables · sorted by size"));
         assert!(size.find("a.rs:1:1  alpha") < size.find("z.rs:1:1  zeta"));
         assert!(size.find("z.rs:1:1  zeta") < size.find("a.rs:1:1  beta"));
     }

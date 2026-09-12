@@ -1,8 +1,9 @@
+use std::io::{self, Write};
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use kompass::{OutputFormat, SortBy, analyze, discover, output};
+use kompass::{OutputFormat, SortBy, analyze, diff, discover, output};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -19,12 +20,17 @@ Agent workflow:
        kompass --format json PATH > after.json
      Run the relevant behavior tests separately; a score comparison cannot
      prove that behavior is preserved.
-  3. Compare integer fields in JSON. `summary.burden.production` is the
-     production burden in integer tenths (143 means 14.3). Inspect
-     `files[].burden`, `files[].functions[].score.value`, and
-     `files[].functions[].metrics` for file and function detail.
+  3. Compare the reports safely:
+       kompass diff before.json after.json
+     The command checks model, root, file scope, and coverage before showing
+     burden, p95, highest-callable, per-file, and possible-redistribution deltas.
 
-JSON is the agent interface: it includes every analyzed function. `--top`,
+For custom automation, `summary.burden.production` is the production burden in
+integer tenths (143 means 14.3). Inspect `files[].burden`,
+`files[].functions[].score.value`, and `files[].functions[].metrics` for file
+and callable detail.
+
+JSON is the agent interface: it includes every analyzed callable and initializer. `--top`,
 `--sort`, `--tests`, and `--all` affect text output only. Production and test
 categories use the same score but remain scored and summarized separately.
 Only compare reports whose top-level `model` values match.
@@ -34,13 +40,35 @@ failed. Status 2 can still emit a partial JSON report, so a lower burden is
 inconclusive when coverage falls or macro opacity rises.
 
 `macro_opacity.invocations` and `macro_opacity.source_tokens` count macro
-source as written, without expansion, including built-in macros. Compare them
-with burden because a lower score is a review signal, not proof that code is
-cleaner or correct. Semantic module boundaries and coupling are not measured;
-review those manually and do not blindly minimize the score.
+invocation source as written without expansion, including built-in macros.
+`macro_opacity.definitions` and `macro_opacity.definition_tokens` expose macro
+rule bodies separately. Compare them with burden; lower score is a review signal,
+not proof that code is cleaner or correct. Semantic module boundaries and coupling
+are not measured; review those manually and do not blindly minimize the score.
+
+Const and static initializers appear in `files[].functions[]` as callable-like
+`const_initializer` or `static_initializer` units. Their initializer
+expressions are scored exclusively, so moving control flow out of a function
+into an initializer remains visible without counting the same body twice.
+Closures retain the surrounding lexical control-flow depth in their own score,
+so extracting a nested branch into an immediately-created closure does not
+erase its nesting context.
+
+Compare complete reports with:
+     kompass diff BEFORE.json AFTER.json
+The diff command requires the same root, score model, file scope, and complete
+coverage. Pass `--allow-file-changes` only when added or removed files are part
+of the intended comparison; the output then highlights those files and warns
+that aggregate deltas include their burden.
+The comparison also shows production and test callable-count, p95, and highest
+score changes, per-file burden deltas, and conservative possible-redistribution
+signals. A redistribution signal proves no call or extraction relationship.
 "#
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Rust file, directory, or Cargo workspace to analyze.
     #[arg(value_name = "PATH", default_value = ".")]
     path: PathBuf,
@@ -57,13 +85,38 @@ struct Cli {
     #[arg(long)]
     all: bool,
 
-    /// Number of functions to show in the text report.
+    /// Number of callables and initializer units to show in the text report.
     #[arg(long, default_value_t = 10, value_name = "N")]
     top: usize,
 
     /// Primary ordering for text hotspot rankings.
     #[arg(long, value_enum, default_value_t = Sort::Score)]
     sort: Sort,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Compare two complete JSON reports from the same analyzed scope.
+    Diff(DiffArgs),
+}
+
+#[derive(Debug, Args)]
+struct DiffArgs {
+    /// JSON report captured before a refactor.
+    #[arg(value_name = "BEFORE")]
+    before: PathBuf,
+
+    /// JSON report captured after a refactor.
+    #[arg(value_name = "AFTER")]
+    after: PathBuf,
+
+    /// Output format for the comparison.
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    format: Format,
+
+    /// Allow added or removed files, with an explicit scope warning.
+    #[arg(long)]
+    allow_file_changes: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -100,6 +153,42 @@ impl From<Sort> for SortBy {
 
 fn main() {
     let cli = Cli::parse();
+
+    if let Some(Command::Diff(args)) = cli.command {
+        let comparison = match diff::compare_paths_with_options(
+            &args.before,
+            &args.after,
+            diff::CompareOptions {
+                allow_file_changes: args.allow_file_changes,
+            },
+        ) {
+            Ok(comparison) => comparison,
+            Err(error) => {
+                eprintln!("kompass: {error}");
+                std::process::exit(2);
+            }
+        };
+        let rendered = match diff::render_comparison(&comparison, args.format.into()) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                eprintln!("kompass: could not render comparison: {error}");
+                std::process::exit(2);
+            }
+        };
+        let mut stdout = io::BufWriter::new(io::stdout().lock());
+        match stdout
+            .write_all(rendered.as_bytes())
+            .and_then(|_| stdout.flush())
+        {
+            Ok(()) => return,
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return,
+            Err(error) => {
+                eprintln!("kompass: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let discovered = match discover::discover(&cli.path) {
         Ok(files) => files,
         Err(error) => {

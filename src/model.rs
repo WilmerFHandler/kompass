@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 /// Stable identifier for the scoring formula embedded in each report.
-pub const SCORE_MODEL: &str = "structural-v3";
+pub const SCORE_MODEL: &str = "structural-v4";
 
 /// A machine-readable analysis report. JSON output serializes this structure
 /// directly, so adding fields should remain backwards-compatible.
@@ -70,18 +70,26 @@ pub struct FileReport {
     /// Sum of each callable's score, with nested callable bodies counted only
     /// in their own report.
     pub burden: Burden,
-    /// Source macro invocations in this file. Expansion is intentionally
-    /// excluded from the score, so this remains a visible opacity signal.
+    /// Source macro invocations and definitions in this file. Expansion is
+    /// intentionally excluded from the score, so both remain visible opacity
+    /// signals.
     pub macro_opacity: MacroOpacity,
 }
 
 /// Macro coverage that can be measured from the source currently on disk.
 /// `source_tokens` counts lexical tokens in each invocation span, including
 /// the macro path and delimiters, without expanding the invocation.
+/// `definition_tokens` counts lexical tokens in macro definitions, including
+/// their rule bodies, without expanding or parsing those rules as Rust code.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct MacroOpacity {
     pub invocations: usize,
     pub source_tokens: usize,
+    /// Number of macro definitions found in source.
+    pub definitions: usize,
+    /// Lexical tokens in macro definitions, kept separate from invocation
+    /// source tokens so changing a rule body remains visible.
+    pub definition_tokens: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -122,6 +130,8 @@ pub enum FunctionKind {
     TraitMethod,
     NestedFunction,
     Closure,
+    ConstInitializer,
+    StaticInitializer,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]

@@ -1,3 +1,5 @@
+use proc_macro2::Span;
+use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
     Arm, BinOp, Expr, ExprAssign, ExprBinary, ExprCast, ExprIf, ExprIndex, ExprMatch,
@@ -5,6 +7,7 @@ use syn::{
 };
 
 use crate::model::{Metrics, Score};
+use crate::tokens::TokenPosition;
 
 /// Measure the structural signals that are available from a Rust syntax
 /// tree without compiling or expanding the crate.
@@ -26,15 +29,72 @@ pub fn measure(
 /// block or a single expression; the latter is one executable statement for
 /// parity with an equivalent function body.
 pub fn measure_closure(body: &Expr, code_lines: usize, explicit_parameters: usize) -> Metrics {
+    measure_closure_at_depth(body, code_lines, explicit_parameters, 0)
+}
+
+/// Measure a closure body while retaining the lexical control-flow depth at
+/// the closure site. The body remains exclusive to the closure report, but a
+/// closure nested inside an `if` or loop still pays for that surrounding
+/// nesting. This keeps moving a nested branch into an immediately-created
+/// closure from making the aggregate burden look artificially smaller.
+pub fn measure_closure_at_depth(
+    body: &Expr,
+    code_lines: usize,
+    explicit_parameters: usize,
+    base_depth: usize,
+) -> Metrics {
     let mut visitor = MetricsVisitor::default();
     visitor.metrics.code_lines = code_lines;
     visitor.metrics.parameters = explicit_parameters;
     visitor.metrics.explicit_parameters = explicit_parameters;
+    visitor.depth = base_depth;
     if !matches!(body, Expr::Block(_)) {
         visitor.metrics.statements = 1;
     }
     visitor.visit_expr(body);
     visitor.metrics
+}
+
+/// Measure an expression used as an initializer. A block initializer is
+/// scored with its statements, while a single expression is one executable
+/// statement, matching closure expression semantics without inventing a
+/// function signature for the item.
+pub fn measure_expression(
+    expression: &Expr,
+    code_lines: usize,
+    parameters: usize,
+    explicit_parameters: usize,
+) -> Metrics {
+    let mut visitor = MetricsVisitor::default();
+    visitor.metrics.code_lines = code_lines;
+    visitor.metrics.parameters = parameters;
+    visitor.metrics.explicit_parameters = explicit_parameters;
+    if !matches!(expression, Expr::Block(_)) {
+        visitor.metrics.statements = 1;
+    }
+    visitor.visit_expr(expression);
+    visitor.metrics
+}
+
+/// The source location and lexical control-flow depth of a closure.
+/// Locations are used by the analyzer to match this structural pass with the
+/// independently reported closure body without storing AST nodes in reports.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ClosureDepth {
+    pub start: TokenPosition,
+    pub end: TokenPosition,
+    pub depth: usize,
+}
+
+/// Find lexical control-flow depth for every closure in a source file.
+/// Callable bodies reset depth to zero, while closure bodies retain their
+/// enclosing depth so nested closures inherit the same context. The traversal
+/// mirrors the scoring visitor's branch semantics and intentionally ignores
+/// macro expansion.
+pub fn closure_base_depths(file: &syn::File) -> Vec<ClosureDepth> {
+    let mut visitor = ClosureDepthVisitor::default();
+    visitor.visit_file(file);
+    visitor.closures
 }
 
 /// Score a function using Kompass's current structural model. Scores are
@@ -92,6 +152,143 @@ impl MetricsVisitor {
         self.depth += 1;
         visit(self);
         self.depth -= 1;
+    }
+}
+
+#[derive(Default)]
+struct ClosureDepthVisitor {
+    depth: usize,
+    closures: Vec<ClosureDepth>,
+}
+
+impl ClosureDepthVisitor {
+    fn branch(&mut self) {
+        self.depth = self.depth.saturating_add(1);
+    }
+
+    fn with_depth(&mut self, visit: impl FnOnce(&mut Self)) {
+        self.branch();
+        visit(self);
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn with_callable(&mut self, visit: impl FnOnce(&mut Self)) {
+        let previous = self.depth;
+        self.depth = 0;
+        visit(self);
+        self.depth = previous;
+    }
+
+    fn record_closure(&mut self, span: Span) {
+        let start = span.start();
+        let end = span.end();
+        self.closures.push(ClosureDepth {
+            start: TokenPosition {
+                line: start.line,
+                column: start.column,
+            },
+            end: TokenPosition {
+                line: end.line,
+                column: end.column,
+            },
+            depth: self.depth,
+        });
+    }
+}
+
+impl<'ast> Visit<'ast> for ClosureDepthVisitor {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        self.with_callable(|visitor| visitor.visit_block(&node.block));
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        self.with_callable(|visitor| visitor.visit_block(&node.block));
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        if let Some(block) = &node.default {
+            self.with_callable(|visitor| visitor.visit_block(block));
+        }
+    }
+
+    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+        self.with_callable(|visitor| visitor.visit_expr(&node.expr));
+    }
+
+    fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+        self.with_callable(|visitor| visitor.visit_expr(&node.expr));
+    }
+
+    fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
+        self.with_callable(|visitor| visitor.visit_expr(&node.expr));
+    }
+
+    fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
+        if let Some((_, expression)) = &node.default {
+            self.with_callable(|visitor| visitor.visit_expr(expression));
+        }
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast ExprIf) {
+        self.visit_expr(&node.cond);
+        self.with_depth(|visitor| visitor.visit_block(&node.then_branch));
+        if let Some((_, else_branch)) = &node.else_branch {
+            if let Expr::If(else_if) = else_branch.as_ref() {
+                self.visit_expr_if(else_if);
+            } else {
+                self.with_depth(|visitor| visitor.visit_expr(else_branch));
+            }
+        }
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast ExprMatch) {
+        self.visit_expr(&node.expr);
+        self.with_depth(|visitor| {
+            for arm in &node.arms {
+                visitor.visit_arm(arm);
+            }
+        });
+    }
+
+    fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+        self.with_depth(|visitor| visitor.visit_block(&node.body));
+    }
+
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        self.visit_pat(&node.pat);
+        self.visit_expr(&node.expr);
+        self.with_depth(|visitor| visitor.visit_block(&node.body));
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        self.visit_expr(&node.cond);
+        self.with_depth(|visitor| visitor.visit_block(&node.body));
+    }
+
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        if let Some(init) = &node.init
+            && let Some((_, diverge)) = &init.diverge
+        {
+            self.visit_pat(&node.pat);
+            self.visit_expr(&init.expr);
+            self.with_depth(|visitor| {
+                if let Expr::Block(block) = diverge.as_ref() {
+                    visitor.visit_block(&block.block);
+                } else {
+                    visitor.visit_expr(diverge);
+                }
+            });
+            return;
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+        self.record_closure(node.span());
+        // A closure is its own callable, but its nested closures still need
+        // their lexical depth. Keep the current base and traverse the body;
+        // branch nodes inside the body add their normal depth increments.
+        self.visit_expr(&node.body);
     }
 }
 
@@ -414,5 +611,30 @@ mod tests {
 
         assert_eq!(parent.expression_operations, 0);
         assert_eq!(child.expression_operations, 1);
+    }
+
+    #[test]
+    fn closure_depths_retain_their_surrounding_control_flow() {
+        let file: syn::File = syn::parse_str(
+            "fn f(value: bool) { if value { let outer = || if value { let inner = || if value { work(); }; inner(); }; outer(); } }",
+        )
+        .unwrap();
+        let depths = closure_base_depths(&file);
+
+        assert_eq!(depths.len(), 2);
+        assert_eq!(depths[0].depth, 1);
+        assert_eq!(depths[1].depth, 2);
+    }
+
+    #[test]
+    fn closure_scoring_can_carry_a_lexical_base_depth() {
+        let closure: syn::ExprClosure = syn::parse_str("|| if value { work(); }").unwrap();
+        let at_root = measure_closure(&closure.body, 1, closure.inputs.len());
+        let nested = measure_closure_at_depth(&closure.body, 1, closure.inputs.len(), 2);
+
+        assert_eq!(at_root.nesting_penalty, 0);
+        assert_eq!(nested.nesting_penalty, 2);
+        assert_eq!(nested.max_depth, 3);
+        assert!(score(&nested).value > score(&at_root).value);
     }
 }

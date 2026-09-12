@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Attribute, FnArg, ItemFn, ItemMod, Meta, Token};
+use syn::{Attribute, FnArg, ItemConst, ItemFn, ItemMod, ItemStatic, Meta, Token};
 
 use crate::discover::{DiscoveredFile, Discovery};
 use crate::model::{
@@ -374,14 +374,22 @@ fn summarize_macro_opacity(files: &[FileReport]) -> MacroOpacity {
         opacity.source_tokens = opacity
             .source_tokens
             .saturating_add(file.macro_opacity.source_tokens);
+        opacity.definitions = opacity
+            .definitions
+            .saturating_add(file.macro_opacity.definitions);
+        opacity.definition_tokens = opacity
+            .definition_tokens
+            .saturating_add(file.macro_opacity.definition_tokens);
     }
     opacity
 }
 
 /// Count source macro invocations whose spans are available in syn. Macro
-/// definitions are excluded: they describe expansion rules rather than an
-/// opaque invocation in the analyzed program. The token count makes the
-/// unexpanded source area visible without pretending it is a complexity cost.
+/// definitions are measured separately: they describe expansion rules rather
+/// than opaque invocations in the analyzed program, but changing their rule
+/// bodies must remain visible to a before/after review. The token counts make
+/// both unexpanded source areas visible without pretending either is a
+/// complexity cost.
 fn measure_macro_opacity(syntax: &syn::File, lexed: &LexedSource) -> MacroOpacity {
     let mut collector = MacroOpacityCollector {
         lexed,
@@ -397,28 +405,57 @@ struct MacroOpacityCollector<'a> {
 }
 
 impl<'ast> Visit<'ast> for MacroOpacityCollector<'_> {
+    fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        if node.ident.is_some() {
+            let span = node.span();
+            self.opacity.definitions = self.opacity.definitions.saturating_add(1);
+            self.opacity.definition_tokens = self
+                .opacity
+                .definition_tokens
+                .saturating_add(tokens_in_span(self.lexed, span));
+            // Macro rule bodies are token streams, not parsed Rust items, so
+            // visiting them cannot discover additional source invocations.
+            for attribute in &node.attrs {
+                self.visit_attribute(attribute);
+            }
+            return;
+        }
+        self.visit_macro(&node.mac);
+        for attribute in &node.attrs {
+            self.visit_attribute(attribute);
+        }
+    }
+
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
         if !node.path.is_ident("macro_rules") && !node.path.is_ident("macro_rules_attribute") {
-            let span = node.span();
-            let start = span.start();
-            let end = span.end();
             self.opacity.invocations = self.opacity.invocations.saturating_add(1);
-            self.opacity.source_tokens =
-                self.opacity
-                    .source_tokens
-                    .saturating_add(self.lexed.tokens_in(
-                        TokenPosition {
-                            line: start.line,
-                            column: start.column,
-                        },
-                        TokenPosition {
-                            line: end.line,
-                            column: end.column,
-                        },
-                    ));
+            self.opacity.source_tokens = self
+                .opacity
+                .source_tokens
+                .saturating_add(tokens_in_span(self.lexed, node.span()));
         }
         visit::visit_macro(self, node);
     }
+}
+
+fn span_to_token_range(span: proc_macro2::Span) -> (TokenPosition, TokenPosition) {
+    let start = span.start();
+    let end = span.end();
+    (
+        TokenPosition {
+            line: start.line,
+            column: start.column,
+        },
+        TokenPosition {
+            line: end.line,
+            column: end.column,
+        },
+    )
+}
+
+fn tokens_in_span(lexed: &LexedSource, span: proc_macro2::Span) -> usize {
+    let (start, end) = span_to_token_range(span);
+    lexed.tokens_in(start, end)
 }
 
 struct Collection {
@@ -431,12 +468,17 @@ fn collect_functions(
     line_analysis: &LineAnalysis,
     file_is_test: bool,
 ) -> Collection {
+    let closure_depths = score::closure_base_depths(syntax)
+        .into_iter()
+        .map(|closure| ((closure.start, closure.end), closure.depth))
+        .collect();
     let mut collector = FunctionCollector {
         lexed,
         line_analysis,
         test_context: file_is_test,
         scopes: Vec::new(),
         function_depth: 0,
+        closure_depths,
         functions: Vec::new(),
     };
     collector.visit_file(syntax);
@@ -451,10 +493,93 @@ struct FunctionCollector<'a> {
     test_context: bool,
     scopes: Vec<String>,
     function_depth: usize,
+    closure_depths: BTreeMap<(TokenPosition, TokenPosition), usize>,
     functions: Vec<FunctionReport>,
 }
 
 impl<'ast> Visit<'ast> for FunctionCollector<'_> {
+    fn visit_item_const(&mut self, node: &'ast ItemConst) {
+        let category = if self.test_context || has_test_only_attribute(&node.attrs) {
+            Category::Test
+        } else {
+            Category::Production
+        };
+        self.functions.push(make_initializer_report(
+            self.qualified_name(&node.ident.to_string()),
+            FunctionKind::ConstInitializer,
+            category,
+            &node.expr,
+            node.span(),
+            FunctionSource {
+                lexed: self.lexed,
+                line_analysis: self.line_analysis,
+            },
+        ));
+        visit::visit_item_const(self, node);
+    }
+
+    fn visit_item_static(&mut self, node: &'ast ItemStatic) {
+        let category = if self.test_context || has_test_only_attribute(&node.attrs) {
+            Category::Test
+        } else {
+            Category::Production
+        };
+        self.functions.push(make_initializer_report(
+            self.qualified_name(&node.ident.to_string()),
+            FunctionKind::StaticInitializer,
+            category,
+            &node.expr,
+            node.span(),
+            FunctionSource {
+                lexed: self.lexed,
+                line_analysis: self.line_analysis,
+            },
+        ));
+        visit::visit_item_static(self, node);
+    }
+
+    fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
+        let category = if self.test_context || has_test_only_attribute(&node.attrs) {
+            Category::Test
+        } else {
+            Category::Production
+        };
+        self.functions.push(make_initializer_report(
+            self.qualified_name(&node.ident.to_string()),
+            FunctionKind::ConstInitializer,
+            category,
+            &node.expr,
+            node.span(),
+            FunctionSource {
+                lexed: self.lexed,
+                line_analysis: self.line_analysis,
+            },
+        ));
+        visit::visit_impl_item_const(self, node);
+    }
+
+    fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
+        let category = if self.test_context || has_test_only_attribute(&node.attrs) {
+            Category::Test
+        } else {
+            Category::Production
+        };
+        if let Some((_, expression)) = &node.default {
+            self.functions.push(make_initializer_report(
+                self.qualified_name(&node.ident.to_string()),
+                FunctionKind::ConstInitializer,
+                category,
+                expression,
+                node.span(),
+                FunctionSource {
+                    lexed: self.lexed,
+                    line_analysis: self.line_analysis,
+                },
+            ));
+        }
+        visit::visit_trait_item_const(self, node);
+    }
+
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         let name = self.qualified_name(&node.sig.ident.to_string());
         let category = if self.test_context || has_test_only_attribute(&node.attrs) {
@@ -598,6 +723,13 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
             },
             node,
             code_lines,
+            self.closure_depths
+                .get(&(
+                    span_to_token_range(node.span()).0,
+                    span_to_token_range(node.span()).1,
+                ))
+                .copied()
+                .unwrap_or(0),
             FunctionSource {
                 lexed: self.lexed,
                 line_analysis: self.line_analysis,
@@ -685,13 +817,15 @@ fn make_closure_report(
     category: Category,
     closure: &syn::ExprClosure,
     code_lines: usize,
+    base_depth: usize,
     function_source: FunctionSource<'_>,
 ) -> FunctionReport {
     let span = closure.span();
     let start = span.start();
     let end = span.end();
     let parameters = closure.inputs.len();
-    let metrics = score::measure_closure(&closure.body, code_lines, parameters);
+    let metrics =
+        score::measure_closure_at_depth(&closure.body, code_lines, parameters, base_depth);
     let token_count = function_source.lexed.tokens_in(
         TokenPosition {
             line: start.line,
@@ -706,6 +840,43 @@ fn make_closure_report(
     FunctionReport {
         name,
         kind: FunctionKind::Closure,
+        category,
+        location: Location {
+            start: Position {
+                line: start.line,
+                column: start.column + 1,
+            },
+            end: Position {
+                line: end.line,
+                column: end.column + 1,
+            },
+        },
+        lines: end.line.saturating_sub(start.line) + 1,
+        tokens: token_count,
+        score: score::score(&metrics),
+        metrics,
+    }
+}
+
+fn make_initializer_report(
+    name: String,
+    kind: FunctionKind,
+    category: Category,
+    expression: &syn::Expr,
+    item_span: proc_macro2::Span,
+    function_source: FunctionSource<'_>,
+) -> FunctionReport {
+    let start = item_span.start();
+    let end = item_span.end();
+    let code_lines = function_source
+        .line_analysis
+        .code_lines_in_range(start.line, end.line);
+    let metrics = score::measure_expression(expression, code_lines, 0, 0);
+    let token_count = tokens_in_span(function_source.lexed, item_span);
+
+    FunctionReport {
+        name,
+        kind,
         category,
         location: Location {
             start: Position {
@@ -1238,6 +1409,109 @@ mod tests {
     }
 
     #[test]
+    fn reports_const_static_and_associated_initializers() {
+        let source = r#"
+            const TOP: i32 = { if true { 1 } else { 2 } };
+            static GLOBAL: i32 = { if false { 3 } else { 4 } };
+            struct Thing;
+            impl Thing {
+                const ASSOCIATED: i32 = { let value = 5; value };
+            }
+            trait Trait {
+                const DEFAULTED: i32 = { if true { 6 } else { 7 } };
+                const REQUIRED: i32;
+            }
+            fn run() {
+                const LOCAL: i32 = { if true { 8 } else { 9 } };
+                let _ = LOCAL;
+            }
+        "#;
+        let lexed = tokens::lex(source).unwrap();
+        let syntax = syn::parse_file(source).unwrap();
+        let line_analysis = classify_lines(source);
+        let collection = collect_functions(&syntax, &lexed, &line_analysis, false);
+
+        assert_eq!(collection.functions.len(), 6);
+        let initializer = |name: &str, kind: FunctionKind| {
+            collection
+                .functions
+                .iter()
+                .find(|function| function.name == name && function.kind == kind)
+                .unwrap_or_else(|| panic!("missing initializer {name}"))
+        };
+
+        assert_eq!(
+            initializer("TOP", FunctionKind::ConstInitializer)
+                .metrics
+                .control_decisions,
+            1
+        );
+        assert_eq!(
+            initializer("GLOBAL", FunctionKind::StaticInitializer)
+                .metrics
+                .control_decisions,
+            1
+        );
+        assert!(
+            initializer("Thing::ASSOCIATED", FunctionKind::ConstInitializer)
+                .metrics
+                .statements
+                > 0
+        );
+        assert_eq!(
+            initializer("Trait::DEFAULTED", FunctionKind::ConstInitializer)
+                .metrics
+                .control_decisions,
+            1
+        );
+        assert!(
+            collection
+                .functions
+                .iter()
+                .all(|function| function.name != "Trait::REQUIRED")
+        );
+        assert_eq!(
+            initializer("run::LOCAL", FunctionKind::ConstInitializer)
+                .metrics
+                .control_decisions,
+            1
+        );
+
+        let run = collection
+            .functions
+            .iter()
+            .find(|function| function.name == "run")
+            .unwrap();
+        assert_eq!(run.metrics.control_decisions, 0);
+    }
+
+    #[test]
+    fn closure_extraction_keeps_surrounding_nesting_in_the_child() {
+        let source =
+            "fn run(value: bool) { if value { let check = || if value { work(); }; check(); } }";
+        let lexed = tokens::lex(source).unwrap();
+        let syntax = syn::parse_file(source).unwrap();
+        let line_analysis = classify_lines(source);
+        let collection = collect_functions(&syntax, &lexed, &line_analysis, false);
+        let parent = collection
+            .functions
+            .iter()
+            .find(|function| function.name == "run")
+            .unwrap();
+        let closure = collection
+            .functions
+            .iter()
+            .find(|function| function.kind == FunctionKind::Closure)
+            .unwrap();
+
+        assert_eq!(parent.metrics.control_decisions, 1);
+        assert_eq!(parent.metrics.nesting_penalty, 0);
+        assert_eq!(closure.metrics.control_decisions, 1);
+        assert_eq!(closure.metrics.nesting_penalty, 1);
+        assert_eq!(closure.metrics.call_sites, 1);
+    }
+
+    #[test]
     fn macro_opacity_counts_source_invocations_and_tokens() {
         let source = r#"
             macro_rules! make_item { ($item:item) => { $item }; }
@@ -1253,7 +1527,20 @@ mod tests {
         let opacity = measure_macro_opacity(&syntax, &lexed);
 
         assert_eq!(opacity.invocations, 3);
+        assert_eq!(opacity.definitions, 1);
         assert!(opacity.source_tokens >= opacity.invocations);
+        assert!(opacity.definition_tokens > 0);
+
+        let changed_source = source.replace(
+            "($item:item) => { $item }",
+            "($item:item) => { if true { $item } else { $item } }",
+        );
+        let changed_lexed = tokens::lex(&changed_source).unwrap();
+        let changed_syntax = syn::parse_file(&changed_source).unwrap();
+        let changed_opacity = measure_macro_opacity(&changed_syntax, &changed_lexed);
+        assert_eq!(changed_opacity.invocations, opacity.invocations);
+        assert_eq!(changed_opacity.definitions, opacity.definitions);
+        assert!(changed_opacity.definition_tokens > opacity.definition_tokens);
     }
 
     #[test]
