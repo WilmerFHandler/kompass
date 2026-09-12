@@ -8,12 +8,15 @@ use std::process::Command;
 use ignore::WalkBuilder;
 use serde::Deserialize;
 
+use crate::model::{Category, Language};
+
 /// A source file selected for analysis. Cargo target context marks integration
 /// tests and benchmarks before syntax-level `cfg(test)` classification runs.
 #[derive(Clone, Debug)]
 pub struct DiscoveredFile {
     pub path: PathBuf,
-    pub is_test: bool,
+    pub language: Language,
+    pub category: Category,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -43,29 +46,61 @@ impl Display for DiscoveryError {
 
 impl Error for DiscoveryError {}
 
-/// Discover Rust source files from an explicit file/directory or a Cargo
-/// package/workspace root. Cargo metadata supplies exact package targets when
-/// available. A deterministic filesystem walk is used for lightweight source
-/// trees that do not contain a Cargo manifest.
+/// Languages that can be selected by the command line. Explicit source files
+/// always win over this filter, so `kompass --language rust script.py` still
+/// analyzes the requested file.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LanguageFilter {
+    #[default]
+    All,
+    Rust,
+    Python,
+}
+
+impl LanguageFilter {
+    pub const fn includes(self, language: Language) -> bool {
+        matches!(
+            (self, language),
+            (Self::All, _) | (Self::Rust, Language::Rust) | (Self::Python, Language::Python)
+        )
+    }
+}
+
+/// Discover source files from an explicit file/directory or a Cargo
+/// package/workspace root. Cargo metadata supplies exact Rust package targets
+/// when available, while Python files are walked from the requested root so
+/// scripts outside Cargo package roots remain visible.
 pub fn discover(input: &Path) -> Result<Discovery, DiscoveryError> {
+    discover_with_language(input, LanguageFilter::All)
+}
+
+/// Discover source files while applying a language filter to directory walks.
+/// An explicit file remains authoritative and is discovered regardless of the
+/// selected filter.
+pub fn discover_with_language(
+    input: &Path,
+    language_filter: LanguageFilter,
+) -> Result<Discovery, DiscoveryError> {
     let path = fs::canonicalize(input).map_err(|error| {
         DiscoveryError::new(format!("cannot access '{}': {error}", input.display()))
     })?;
 
     if path.is_file() {
-        if !is_rust_file(&path) {
+        let Some(language) = language_for_path(&path) else {
             return Err(DiscoveryError::new(format!(
-                "'{}' is not a Rust source file",
+                "'{}' is not a Rust or Python source file",
                 input.display()
             )));
-        }
+        };
+        let category = category_for_path(&path, language);
 
         return Ok(Discovery {
             files: vec![DiscoveredFile {
                 path,
-                is_test: false,
+                language,
+                category,
             }],
-            test_files: 0,
+            test_files: usize::from(category == Category::Test),
         });
     }
 
@@ -76,15 +111,25 @@ pub fn discover(input: &Path) -> Result<Discovery, DiscoveryError> {
         )));
     }
 
-    if path.join("Cargo.toml").is_file() {
-        return discover_cargo_targets(&path);
+    // A virtual-environment root is a dependency tree even when it is passed
+    // directly, so keep its interpreter metadata from turning the environment
+    // into an analyzed project.
+    if should_skip_directory(&path) {
+        return Ok(Discovery::default());
     }
 
-    discover_filesystem(&path)
+    if path.join("Cargo.toml").is_file() && language_filter.includes(Language::Rust) {
+        return discover_cargo_targets(&path, language_filter);
+    }
+
+    discover_filesystem(&path, language_filter)
         .map_err(|error| DiscoveryError::new(format!("cannot scan '{}': {error}", input.display())))
 }
 
-fn discover_cargo_targets(root: &Path) -> Result<Discovery, DiscoveryError> {
+fn discover_cargo_targets(
+    root: &Path,
+    language_filter: LanguageFilter,
+) -> Result<Discovery, DiscoveryError> {
     let manifest = root.join("Cargo.toml");
     let output = Command::new("cargo")
         .args([
@@ -125,6 +170,7 @@ fn discover_cargo_targets(root: &Path) -> Result<Discovery, DiscoveryError> {
         ))
     })?;
     let mut paths = BTreeSet::new();
+    let mut python_paths = BTreeSet::new();
     let mut package_roots = BTreeSet::new();
     let mut test_target_paths = BTreeSet::new();
 
@@ -135,7 +181,7 @@ fn discover_cargo_targets(root: &Path) -> Result<Discovery, DiscoveryError> {
         }
         for target in package.targets {
             let path = absolute_path(root, PathBuf::from(target.src_path));
-            if !is_rust_file(&path) {
+            if !language_filter.includes(Language::Rust) || !is_rust_file(&path) {
                 continue;
             }
             // Cargo target paths are authoritative, including custom targets
@@ -153,40 +199,96 @@ fn discover_cargo_targets(root: &Path) -> Result<Discovery, DiscoveryError> {
     }
 
     for package_root in package_roots {
-        walk(&package_root, &mut paths).map_err(|error| {
+        walk(
+            &package_root,
+            &mut paths,
+            &mut BTreeSet::new(),
+            LanguageFilter::Rust,
+        )
+        .map_err(|error| {
             DiscoveryError::new(format!("cannot scan '{}': {error}", package_root.display()))
         })?;
     }
 
-    let files = paths
+    // Python projects commonly live beside, or outside, a Rust package. Scan
+    // the requested root separately so Cargo's package-root restriction for
+    // Rust does not hide scripts and tests.
+    if language_filter.includes(Language::Python) {
+        walk(
+            root,
+            &mut BTreeSet::new(),
+            &mut python_paths,
+            LanguageFilter::Python,
+        )
+        .map_err(|error| {
+            DiscoveryError::new(format!("cannot scan '{}': {error}", root.display()))
+        })?;
+    }
+
+    let mut files = paths
         .into_iter()
-        .map(|path| DiscoveredFile {
-            is_test: is_test_path(&path) || test_target_paths.contains(&path),
-            path,
+        .map(|path| {
+            let category = if is_test_path(&path) || test_target_paths.contains(&path) {
+                Category::Test
+            } else {
+                Category::Production
+            };
+            DiscoveredFile {
+                path,
+                language: Language::Rust,
+                category,
+            }
         })
         .collect::<Vec<_>>();
-    let test_files = files.iter().filter(|file| file.is_test).count();
+    files.extend(python_paths.into_iter().map(|path| DiscoveredFile {
+        category: category_for_path(&path, Language::Python),
+        language: Language::Python,
+        path,
+    }));
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let test_files = files
+        .iter()
+        .filter(|file| file.category == Category::Test)
+        .count();
 
     Ok(Discovery { files, test_files })
 }
 
-fn discover_filesystem(root: &Path) -> std::io::Result<Discovery> {
+fn discover_filesystem(root: &Path, language_filter: LanguageFilter) -> std::io::Result<Discovery> {
     let mut paths = BTreeSet::new();
-    walk(root, &mut paths)?;
+    let mut python_paths = BTreeSet::new();
+    walk(root, &mut paths, &mut python_paths, language_filter)?;
+
+    let mut files = paths
+        .into_iter()
+        .map(|path| DiscoveredFile {
+            category: category_for_path(&path, Language::Rust),
+            language: Language::Rust,
+            path,
+        })
+        .collect::<Vec<_>>();
+    files.extend(python_paths.into_iter().map(|path| DiscoveredFile {
+        category: category_for_path(&path, Language::Python),
+        language: Language::Python,
+        path,
+    }));
+    files.sort_by(|left, right| left.path.cmp(&right.path));
 
     Ok(Discovery {
-        files: paths
-            .into_iter()
-            .map(|path| DiscoveredFile {
-                path,
-                is_test: false,
-            })
-            .collect(),
-        test_files: 0,
+        test_files: files
+            .iter()
+            .filter(|file| file.category == Category::Test)
+            .count(),
+        files,
     })
 }
 
-fn walk(directory: &Path, paths: &mut BTreeSet<PathBuf>) -> std::io::Result<()> {
+fn walk(
+    directory: &Path,
+    rust_paths: &mut BTreeSet<PathBuf>,
+    python_paths: &mut BTreeSet<PathBuf>,
+    language_filter: LanguageFilter,
+) -> std::io::Result<()> {
     let mut builder = WalkBuilder::new(directory);
     builder.standard_filters(true);
     builder.filter_entry(|entry| entry.depth() == 0 || !should_skip_directory(entry.path()));
@@ -196,8 +298,18 @@ fn walk(directory: &Path, paths: &mut BTreeSet<PathBuf>) -> std::io::Result<()> 
         let Some(file_type) = entry.file_type() else {
             continue;
         };
-        if file_type.is_file() && is_rust_file(entry.path()) {
-            paths.insert(entry.into_path());
+        if !file_type.is_file() {
+            continue;
+        }
+        let path = entry.into_path();
+        match language_for_path(&path) {
+            Some(Language::Rust) if language_filter.includes(Language::Rust) => {
+                rust_paths.insert(path);
+            }
+            Some(Language::Python) if language_filter.includes(Language::Python) => {
+                python_paths.insert(path);
+            }
+            _ => {}
         }
     }
 
@@ -214,16 +326,50 @@ fn absolute_path(root: &Path, path: PathBuf) -> PathBuf {
 }
 
 fn should_skip_directory(path: &Path) -> bool {
-    path.file_name().is_some_and(|name| {
-        matches!(
-            name.to_str(),
-            Some(".git" | "target" | ".cargo" | "vendor" | "node_modules")
-        )
-    })
+    path.join("pyvenv.cfg").is_file()
+        || path.file_name().is_some_and(|name| {
+            matches!(
+                name.to_str(),
+                Some(
+                    ".git"
+                        | "target"
+                        | ".cargo"
+                        | "vendor"
+                        | "node_modules"
+                        | ".venv"
+                        | "venv"
+                        | "__pycache__"
+                        | ".tox"
+                        | ".nox"
+                )
+            )
+        })
 }
 
 fn is_rust_file(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension == "rs")
+}
+
+fn is_python_file(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "py")
+}
+
+fn language_for_path(path: &Path) -> Option<Language> {
+    if is_rust_file(path) {
+        Some(Language::Rust)
+    } else if is_python_file(path) {
+        Some(Language::Python)
+    } else {
+        None
+    }
+}
+
+fn category_for_path(path: &Path, language: Language) -> Category {
+    if language == Language::Python && is_python_test_path(path) {
+        Category::Test
+    } else {
+        Category::Production
+    }
 }
 
 fn is_test_path(path: &Path) -> bool {
@@ -233,6 +379,20 @@ fn is_test_path(path: &Path) -> bool {
             .to_str()
             .is_some_and(|name| name == "tests" || name == "benches")
     })
+}
+
+fn is_python_test_path(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name == "tests")
+    }) || file_name == "conftest.py"
+        || file_name.starts_with("test_") && file_name.ends_with(".py")
+        || file_name.ends_with("_test.py")
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,11 +424,117 @@ mod tests {
     }
 
     #[test]
+    fn python_test_conventions_and_language_filter_are_stable() {
+        assert!(is_python_test_path(Path::new("project/tests/http.py")));
+        assert!(is_python_test_path(Path::new("project/test_parser.py")));
+        assert!(is_python_test_path(Path::new("project/parser_test.py")));
+        assert!(is_python_test_path(Path::new("project/conftest.py")));
+        assert!(!is_python_test_path(Path::new("project/src/parser.py")));
+        assert!(LanguageFilter::All.includes(Language::Rust));
+        assert!(LanguageFilter::All.includes(Language::Python));
+        assert!(LanguageFilter::Python.includes(Language::Python));
+        assert!(!LanguageFilter::Python.includes(Language::Rust));
+    }
+
+    #[test]
     fn build_output_and_dependency_directories_are_skipped() {
         assert!(should_skip_directory(Path::new("target")));
         assert!(should_skip_directory(Path::new(".git")));
         assert!(should_skip_directory(Path::new("vendor")));
         assert!(!should_skip_directory(Path::new("src")));
+    }
+
+    #[test]
+    fn python_dependency_trees_are_skipped_and_ignored_files_remain_ignored() {
+        let root = std::env::temp_dir().join(format!(
+            "kompass-python-discovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for directory in [
+            "src",
+            "tests",
+            ".venv/lib",
+            "venv/lib",
+            "__pycache__",
+            ".tox",
+            ".nox",
+            "embedded-env/lib",
+            "ignored",
+        ] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        std::fs::write(root.join("src/app.py"), "def app():\n    return 1\n").unwrap();
+        std::fs::write(
+            root.join("tests/test_app.py"),
+            "def test_app():\n    pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("parser_test.py"),
+            "def test_parser():\n    pass\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("conftest.py"), "def fixture():\n    pass\n").unwrap();
+        for directory in [
+            ".venv/lib",
+            "venv/lib",
+            "__pycache__",
+            ".tox",
+            ".nox",
+            "embedded-env/lib",
+            "ignored",
+        ] {
+            std::fs::write(
+                root.join(directory).join("hidden.py"),
+                "def hidden():\n    pass\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(root.join("embedded-env/pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(root.join(".ignore"), "ignored/\n").unwrap();
+
+        let discovery = discover_with_language(&root, LanguageFilter::Python).unwrap();
+        let paths = discovery
+            .files
+            .iter()
+            .map(|file| file.path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("conftest.py"),
+                PathBuf::from("parser_test.py"),
+                PathBuf::from("src/app.py"),
+                PathBuf::from("tests/test_app.py"),
+            ]
+        );
+        assert!(
+            discovery
+                .files
+                .iter()
+                .all(|file| file.language == Language::Python)
+        );
+        assert_eq!(discovery.test_files, 3);
+        assert!(
+            discovery
+                .files
+                .iter()
+                .filter(|file| file.category == Category::Test)
+                .count()
+                == 3
+        );
+
+        let explicit =
+            discover_with_language(&root.join("src/app.py"), LanguageFilter::Rust).unwrap();
+        assert_eq!(explicit.files.len(), 1);
+        assert_eq!(explicit.files[0].language, Language::Python);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -297,7 +563,7 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "ignored-by-git/\n").unwrap();
         std::fs::write(root.join(".ignore"), "ignored-by-ignore/\n").unwrap();
 
-        let discovery = discover_filesystem(&root).unwrap();
+        let discovery = discover_filesystem(&root, LanguageFilter::All).unwrap();
         assert_eq!(
             discovery
                 .files
@@ -351,12 +617,11 @@ mod tests {
         std::fs::write(&external_source, "pub fn shared() {}\n").unwrap();
 
         let discovery = discover(&package).unwrap();
-        assert!(
-            discovery
-                .files
-                .iter()
-                .any(|file| { file.path == external_source && !file.is_test })
-        );
+        assert!(discovery.files.iter().any(|file| {
+            file.path == external_source
+                && file.language == Language::Rust
+                && file.category == Category::Production
+        }));
 
         std::fs::remove_dir_all(root).unwrap();
     }

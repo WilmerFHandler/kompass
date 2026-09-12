@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::OutputFormat;
+use crate::model::{AnalysisContract, OutputFormat};
 
 const COMPONENT_NAMES: [&str; 8] = [
     "boundary",
@@ -90,6 +90,7 @@ pub struct ReportMetadata {
     pub root: String,
     pub version: String,
     pub model: String,
+    pub analysis_contract: AnalysisContract,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -258,7 +259,7 @@ fn compare_reports(
     validate_identity("before", &before, &mut issues);
     validate_identity("after", &after, &mut issues);
 
-    if before.tool == "kompass" && after.tool == "kompass" && before.tool != after.tool {
+    if before.tool != after.tool {
         issues.push(format!(
             "tool identifiers differ: before is {:?}, after is {:?}",
             before.tool, after.tool
@@ -268,6 +269,13 @@ fn compare_reports(
         issues.push(format!(
             "score model differs: before is {:?}, after is {:?}; compare reports generated with the same model",
             before.model, after.model
+        ));
+    }
+    if before.analysis_contract != after.analysis_contract {
+        issues.push(format!(
+            "analysis contract differs: before is {}, after is {}; compare reports generated with the same frontend and discovery contract",
+            before.analysis_contract.display(),
+            after.analysis_contract.display()
         ));
     }
     if before.root != after.root {
@@ -298,6 +306,14 @@ fn compare_reports(
             format_paths(added),
             format_paths(removed)
         ));
+    }
+    for path in before_paths.intersection(&after_paths) {
+        if before_files[path].language != after_files[path].language {
+            issues.push(format!(
+                "file language differs for {:?}: before is {:?}, after is {:?}",
+                path, before_files[path].language, after_files[path].language
+            ));
+        }
     }
 
     if !issues.is_empty() {
@@ -401,6 +417,11 @@ fn validate_identity(label: &str, report: &InputReport, issues: &mut Vec<String>
     if report.root.trim().is_empty() {
         issues.push(format!("{label} report has an empty analyzed root"));
     }
+    if !report.analysis_contract.is_complete() {
+        issues.push(format!(
+            "{label} report has an incomplete analysis contract; regenerate it with a multi-language Kompass"
+        ));
+    }
 }
 
 fn validate_coverage(label: &str, report: &InputReport, issues: &mut Vec<String>) {
@@ -445,6 +466,12 @@ fn file_map<'a>(
 ) -> BTreeMap<String, &'a InputFile> {
     let mut files = BTreeMap::new();
     for file in &report.files {
+        if file.language.trim().is_empty() {
+            issues.push(format!(
+                "{label} report has no language for file {:?}; regenerate it with a multi-language Kompass",
+                file.path
+            ));
+        }
         if files.insert(file.path.clone(), file).is_some() {
             issues.push(format!(
                 "{label} report lists file {:?} more than once",
@@ -496,12 +523,19 @@ fn stable_callable_name(
     let mut stable_prefix = String::new();
     for segment in name.split("::") {
         push_name_segment(&mut raw_prefix, segment);
-        if segment.starts_with("<closure@") && segment.ends_with('>') {
+        let located_kind = if segment.starts_with("<closure@") && segment.ends_with('>') {
+            Some("closure")
+        } else if segment.starts_with("<lambda@") && segment.ends_with('>') {
+            Some("lambda")
+        } else {
+            None
+        };
+        if let Some(kind) = located_kind {
             let stable_name = closure_names.entry(raw_prefix.clone()).or_insert_with(|| {
                 let ordinal = next_closure.entry(stable_prefix.clone()).or_default();
                 *ordinal = ordinal.saturating_add(1);
                 let mut generated = stable_prefix.clone();
-                push_name_segment(&mut generated, &format!("<closure#{}>", *ordinal));
+                push_name_segment(&mut generated, &format!("<{kind}#{}>", *ordinal));
                 generated
             });
             stable_prefix.clone_from(stable_name);
@@ -847,6 +881,7 @@ fn metadata(path: &Path, report: &InputReport) -> ReportMetadata {
         root: report.root.clone(),
         version: report.version.clone(),
         model: report.model.clone(),
+        analysis_contract: report.analysis_contract.clone(),
     }
 }
 
@@ -897,6 +932,12 @@ fn render_text(comparison: &Comparison) -> String {
         output,
         "After:  {} · {} · {}",
         comparison.after.path, comparison.after.version, comparison.after.model
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Analysis contract · {}",
+        comparison.before.analysis_contract.display()
     )
     .unwrap();
     if comparison.scope.file_set_changed {
@@ -1181,6 +1222,8 @@ struct InputReport {
     tool: String,
     version: String,
     model: String,
+    #[serde(default)]
+    analysis_contract: AnalysisContract,
     root: String,
     summary: InputSummary,
     coverage: InputCoverage,
@@ -1224,6 +1267,8 @@ struct InputMacroOpacity {
 #[derive(Debug, Deserialize)]
 struct InputFile {
     path: String,
+    #[serde(default)]
+    language: String,
     functions: Vec<InputFunction>,
     #[allow(dead_code)]
     burden: InputBurden,
@@ -1318,6 +1363,11 @@ mod tests {
             tool: "kompass".to_owned(),
             version: "0.1.0".to_owned(),
             model: "test-model".to_owned(),
+            analysis_contract: AnalysisContract {
+                version: "analysis-v1".to_owned(),
+                frontend: "frontends-v1".to_owned(),
+                discovery: "multi-language-v1".to_owned(),
+            },
             root: root.to_owned(),
             summary: InputSummary {
                 burden: InputBurden {
@@ -1347,6 +1397,7 @@ mod tests {
     fn file(path: &str, functions: Vec<InputFunction>) -> InputFile {
         InputFile {
             path: path.to_owned(),
+            language: "rust".to_owned(),
             burden: InputBurden {
                 production: functions.iter().map(|f| f.score.value).sum(),
                 test: 0,
@@ -1383,6 +1434,12 @@ mod tests {
     fn closure(name: &str, value: usize) -> InputFunction {
         let mut function = function(name, value, 0);
         function.kind = "closure".to_owned();
+        function
+    }
+
+    fn lambda(name: &str, value: usize) -> InputFunction {
+        let mut function = function(name, value, 0);
+        function.kind = "lambda".to_owned();
         function
     }
 
@@ -1440,6 +1497,37 @@ mod tests {
             "/repo",
             10,
             vec![file("src/lib.rs", vec![closure("run::<closure@30:9>", 10)])],
+            0,
+            0,
+        );
+
+        let comparison = compare_reports(
+            Path::new("before.json"),
+            Path::new("after.json"),
+            before,
+            after,
+            CompareOptions::default(),
+        )
+        .unwrap();
+
+        assert!(comparison.functions.changed.is_empty());
+        assert!(comparison.functions.added.is_empty());
+        assert!(comparison.functions.removed.is_empty());
+    }
+
+    #[test]
+    fn comparison_matches_lambdas_across_unrelated_line_shifts() {
+        let before = report(
+            "/repo",
+            10,
+            vec![file("module.py", vec![lambda("run::<lambda@10:5>", 10)])],
+            0,
+            0,
+        );
+        let after = report(
+            "/repo",
+            10,
+            vec![file("module.py", vec![lambda("run::<lambda@30:9>", 10)])],
             0,
             0,
         );

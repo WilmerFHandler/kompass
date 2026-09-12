@@ -1,7 +1,21 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Stable identifier for the scoring formula embedded in each report.
 pub const SCORE_MODEL: &str = "structural-v4";
+
+/// Stable identity of the source discovery contract used by a report.
+pub const DISCOVERY_CONTRACT: &str = "multi-language-v1";
+
+/// Stable identity of the language frontend contract used by a report.
+///
+/// The implementation behind a frontend may evolve while this contract stays
+/// fixed only when its serialized `FileAnalysis` semantics remain compatible.
+pub const FRONTEND_CONTRACT: &str = "rust-syn-v1;python-ruff-0.0.10-py314";
+
+/// Stable identity of the complete analysis contract. It intentionally keeps
+/// the score model separate so consumers can tell formula changes from parser
+/// or discovery changes.
+pub const ANALYSIS_CONTRACT: &str = "analysis-v1";
 
 /// A machine-readable analysis report. JSON output serializes this structure
 /// directly, so adding fields should remain backwards-compatible.
@@ -10,6 +24,7 @@ pub struct Report {
     pub tool: String,
     pub version: String,
     pub model: String,
+    pub analysis_contract: AnalysisContract,
     pub root: String,
     pub summary: Summary,
     pub coverage: Coverage,
@@ -29,10 +44,49 @@ pub struct Summary {
     pub files: usize,
     pub code_lines: usize,
     pub tokens: usize,
+    pub languages: LanguageCounts,
     pub production: CategorySummary,
     pub test: CategorySummary,
     /// Sum of the exclusive callable units in every analyzed file.
     pub burden: Burden,
+}
+
+/// Number of analyzed files per source language.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LanguageCounts {
+    pub rust: usize,
+    pub python: usize,
+}
+
+/// Versioned contract for discovery and frontend semantics.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AnalysisContract {
+    pub version: String,
+    pub frontend: String,
+    pub discovery: String,
+}
+
+impl AnalysisContract {
+    pub fn current() -> Self {
+        Self {
+            version: ANALYSIS_CONTRACT.to_owned(),
+            frontend: FRONTEND_CONTRACT.to_owned(),
+            discovery: DISCOVERY_CONTRACT.to_owned(),
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        !self.version.trim().is_empty()
+            && !self.frontend.trim().is_empty()
+            && !self.discovery.trim().is_empty()
+    }
+
+    pub fn display(&self) -> String {
+        format!(
+            "version={} frontend={} discovery={}",
+            self.version, self.frontend, self.discovery
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -64,6 +118,7 @@ pub struct Coverage {
 #[derive(Clone, Debug, Serialize)]
 pub struct FileReport {
     pub path: String,
+    pub language: Language,
     pub lines: LineCounts,
     pub tokens: usize,
     pub functions: Vec<FunctionReport>,
@@ -73,6 +128,16 @@ pub struct FileReport {
     /// Source macro invocations and definitions in this file. Expansion is
     /// intentionally excluded from the score, so both remain visible opacity
     /// signals.
+    pub macro_opacity: MacroOpacity,
+}
+
+/// Language-neutral result returned by a source frontend before the analyzer
+/// adds path, language, and aggregate metadata.
+#[derive(Clone, Debug)]
+pub struct FileAnalysis {
+    pub lines: LineCounts,
+    pub tokens: usize,
+    pub functions: Vec<FunctionReport>,
     pub macro_opacity: MacroOpacity,
 }
 
@@ -107,19 +172,42 @@ pub struct FunctionReport {
     pub category: Category,
     pub location: Location,
     pub lines: usize,
-    /// Rust lexical tokens in the complete function span, including public
-    /// visibility when present. Comments and whitespace are excluded, outer
-    /// attributes are excluded, and macro contents are counted as written.
+    /// Source tokens in the complete callable span. Each language frontend
+    /// defines its lexical token contract; comments and whitespace are excluded.
     pub tokens: usize,
     pub metrics: Metrics,
     pub score: Score,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Category {
     Production,
     Test,
+}
+
+/// Source language represented in a report or discovered file.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    Rust,
+    Python,
+}
+
+impl Language {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Rust => "Rust",
+            Self::Python => "Python",
+        }
+    }
+
+    pub const fn serialized(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -130,6 +218,9 @@ pub enum FunctionKind {
     TraitMethod,
     NestedFunction,
     Closure,
+    Lambda,
+    ModuleInitializer,
+    ClassInitializer,
     ConstInitializer,
     StaticInitializer,
 }

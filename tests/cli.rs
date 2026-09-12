@@ -31,6 +31,11 @@ fn help_explains_agent_workflow_and_json_contract() {
         "files[].burden",
         "files[].functions[].score.value",
         "files[].functions[].metrics",
+        "--language <LANGUAGE>",
+        "possible values: all, rust, python",
+        "summary.languages",
+        "analysis_contract",
+        "frontend and discovery",
         "macro_opacity.invocations",
         "macro_opacity.source_tokens",
         "macro_opacity.definitions",
@@ -41,7 +46,7 @@ fn help_explains_agent_workflow_and_json_contract() {
         "--top",
         "--sort",
         "text output only",
-        "top-level `model` values match",
+        "top-level `model` and `analysis_contract` values match",
         "coverage.complete",
         "errors",
         "status 0",
@@ -90,6 +95,14 @@ fn json_report_contains_separate_categories_and_tokens() {
     assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["model"], "structural-v4");
+    assert_eq!(report["analysis_contract"]["version"], "analysis-v1");
+    assert_eq!(
+        report["analysis_contract"]["discovery"],
+        "multi-language-v1"
+    );
+    assert_eq!(report["files"][0]["language"], "rust");
+    assert_eq!(report["summary"]["languages"]["rust"], 1);
+    assert_eq!(report["summary"]["languages"]["python"], 0);
     assert_eq!(report["summary"]["production"]["functions"], 1);
     assert_eq!(report["summary"]["test"]["functions"], 1);
     assert_eq!(report["files"][0]["functions"][0]["category"], "production");
@@ -99,6 +112,82 @@ fn json_report_contains_separate_categories_and_tokens() {
             .unwrap()
             > 0
     );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn mixed_language_reports_and_language_filters_are_consistent() {
+    let root = temporary_directory("mixed-language");
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(root.join("main.rs"), "fn rust_main() {}\n").unwrap();
+    std::fs::write(
+        root.join("script.py"),
+        "def python_main(value):\n    return value + 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("tests/test_script.py"),
+        "def test_script():\n    assert True\n",
+    )
+    .unwrap();
+
+    let all = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args(["--format", "json", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        all.status.success(),
+        "{}",
+        String::from_utf8_lossy(&all.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&all.stdout).unwrap();
+    assert_eq!(report["summary"]["languages"]["rust"], 1);
+    assert_eq!(report["summary"]["languages"]["python"], 2);
+    assert_eq!(report["summary"]["test"]["functions"], 1);
+    assert_eq!(report["files"].as_array().unwrap().len(), 3);
+
+    let text = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args([root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("Mixed-language structural complexity"));
+    assert!(text.contains("Languages · 1 Rust files · 2 Python files"));
+
+    for (language, expected_files) in [("rust", 1), ("python", 2)] {
+        let filtered = Command::new(env!("CARGO_BIN_EXE_kompass"))
+            .args([
+                "--format",
+                "json",
+                "--language",
+                language,
+                root.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(filtered.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&filtered.stdout).unwrap();
+        assert_eq!(report["summary"]["files"], expected_files);
+    }
+
+    // An explicit file remains authoritative even when the directory filter
+    // names another language.
+    let explicit = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args([
+            "--format",
+            "json",
+            "--language",
+            "python",
+            root.join("main.rs").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(explicit.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&explicit.stdout).unwrap();
+    assert_eq!(report["summary"]["files"], 1);
+    assert_eq!(report["files"][0]["language"], "rust");
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -196,7 +285,7 @@ fn text_shows_the_exact_operation_breakdown() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("Kompass 0.1.0 · Rust structural complexity · structural-v4"));
+    assert!(text.contains("Kompass 0.2.0 · Rust structural complexity · structural-v4"));
     assert!(text.contains(
         "score: 1.4 = 1.0 boundary + 0.0 control decisions + 0.0 nesting + 0.0 boolean operators + 0.2 expression operations + 0.0 call sites + 0.2 explicit parameters + 0.0 match arms"
     ));
@@ -324,6 +413,28 @@ fn diff_rejects_model_and_coverage_mismatches() {
     assert!(stderr.contains("score model differs"), "{stderr}");
 
     report["model"] = original_model;
+    let original_frontend = report["analysis_contract"]["frontend"].clone();
+    let contract_mismatch_path = root.join("contract-mismatch.json");
+    report["analysis_contract"]["frontend"] =
+        serde_json::Value::String("other-frontend".to_owned());
+    std::fs::write(
+        &contract_mismatch_path,
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    let contract_mismatch = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args([
+            "diff",
+            before_path.to_str().unwrap(),
+            contract_mismatch_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(contract_mismatch.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&contract_mismatch.stderr);
+    assert!(stderr.contains("analysis contract differs"), "{stderr}");
+
+    report["analysis_contract"]["frontend"] = original_frontend;
     report["coverage"]["complete"] = serde_json::Value::Bool(false);
     let incomplete_path = root.join("incomplete.json");
     std::fs::write(

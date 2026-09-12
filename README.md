@@ -1,10 +1,10 @@
 # Kompass
 
-Kompass is a Rust-only command-line tool for finding the code that takes the
-most thought to understand and change. It reports a transparent structural
-score for every callable and executable initializer, with the measurements
-behind that score, so a large number points to a place worth reading rather
-than pretending to be a precise prediction of developer time.
+Kompass is a command-line tool for finding the Rust and Python code that takes
+the most thought to understand and change. It reports a transparent
+structural score for every callable and executable initializer, with the
+measurements behind that score, so a large number points to a place worth
+reading rather than pretending to be a precise prediction of developer time.
 
 ## Usage
 
@@ -14,7 +14,7 @@ Run it from a Cargo package or workspace:
 cargo run --release -- .
 ```
 
-You can pass an explicit directory or a single Rust file. For a file named
+You can pass an explicit directory or a single Rust or Python file. For a file named
 `README-example.rs` containing this four-line fixture:
 
 ```rust
@@ -27,16 +27,17 @@ fn increment(value: i32) -> i32 {
 the normal text report is:
 
 ```text
-Kompass 0.1.0 · Rust structural complexity · structural-v4
+Kompass 0.2.0 · Rust structural complexity · structural-v4
 /work/my-project
 1 files · 4 code lines · 20 tokens
+Languages · 1 Rust files · 0 Python files
 Production · 1 callables · total burden 1.3 · average 1.3 · p95 1.3 · highest 1.3
 Tests · 0 callables · total burden 0.0 · average 0.0 · p95 0.0 · highest 0.0
 Repository burden · 1.3 total · 1.3 production · 0.0 tests
 Macro opacity · 0 source invocations · 0 invocation source tokens · 0 definitions · 0 definition tokens · unexpanded and excluded from score
 
 Files by burden · top 10
-    1.3  1 callables · highest 1.3 · 1.3 production · 0.0 tests · README-example.rs
+    1.3  1 callables · highest 1.3 · 1.3 production · 0.0 tests · Rust · README-example.rs
 Coverage complete · 1 of 1 files analyzed
 
 Most complex production callables · sorted by score
@@ -49,6 +50,8 @@ Useful options are:
 
 ```text
 kompass [PATH]                 Analyze the current directory by default
+    --language all|rust|python
+                               Select source languages for directory walks (default all)
     --format text|json         Choose human or machine-readable output
     --top N                    Show N callables in text output (default 10)
     --sort score|depth|size    Order text hotspots by score, max depth, or tokens
@@ -76,7 +79,7 @@ kompass diff before.json after.json
 
 Run the relevant behavior tests separately because a score comparison cannot
 prove that behavior is preserved. Only compare reports whose top-level `model`
-values match.
+and `analysis_contract` values match.
 
 `summary.burden.production` is the production burden in exact integer tenths,
 so `143` means `14.3`. The same report has separate `summary.burden.test` and
@@ -100,7 +103,8 @@ jq '{production_tenths: .summary.burden.production,
      errors: .errors}' before.json
 ```
 
-The comparison command validates the tool and score model, the canonical root,
+The comparison command validates the tool, score model, frontend/discovery
+analysis contract, and canonical root,
 the exact discovered file set, and complete coverage before calculating a
 delta. It reports changed, added, and removed callables, production and test
 burden deltas, callable-count/p95/highest-score deltas, per-file burden deltas,
@@ -134,6 +138,10 @@ collections are sorted for stable output. A report with file-level read, lexer,
 or parser errors is still printed with its successful results and exits with
 status 2. An invalid input path or an output failure also exits with status 2.
 The report's `model` field is always the stable string `structural-v4`.
+`analysis_contract` records the stable frontend and discovery contracts so a
+before/after comparison cannot silently mix parser or file-selection rules.
+Each `files[]` entry has a `language` of `rust` or `python`, and
+`summary.languages` counts analyzed files by language.
 `score.value` and `score.units` are the exact integer tenths used in the formula,
 while `score.display` is the presentation value; consumers should use the
 integer fields for comparisons.
@@ -156,33 +164,47 @@ function_units =
   +  2 * match_arms
 ```
 
-Every callable has one boundary unit. Top-level and associated consts with
-defaults are reported as `const_initializer` units, and statics are reported as
-`static_initializer` units; their initializer expressions are scored
-exclusively, including control flow in a block expression. Trait declarations
-without a default have no executable initializer and are not reported. This
-keeps moving work into a const or static visible in the same burden aggregate.
-`control_decisions` counts `if`,
-`match`, `loop`, `for`, `while`, `let ... else`, and match guards; `&&` and
-`||` are excluded from that count and are charged through
-`boolean_operators`. `call_sites` counts ordinary calls and method calls.
-`explicit_parameters` counts signature inputs except a method receiver, and
-`match_arms` counts every arm. The score is intentionally linear and unbounded,
-so its units are easy to audit and compare without a hidden normalization step.
+Every reported unit has one boundary unit. Rust top-level and associated consts
+with defaults are reported as `const_initializer` units, and statics are
+reported as `static_initializer` units; their initializer expressions are
+scored exclusively, including control flow in a block expression. Trait
+declarations without a default have no executable initializer and are not
+reported. Rust `control_decisions` counts `if`, `match`, `loop`, `for`, `while`,
+`let ... else`, and match guards; `&&` and `||` are charged through
+`boolean_operators` instead.
 
-Nested named functions and closures own their bodies exclusively. The enclosing
-callable still reports that a closure exists, but decisions, statements, calls,
-and nesting inside the closure are scored in the closure's own report. Named
-functions and initializer units start at depth zero; a closure keeps the
-surrounding lexical control-flow depth, so extracting a branch into an
-immediately-created closure does not erase its nesting context. A file's
+Python reports functions, async functions, methods, nested functions, and
+lambdas as separate units. Module and class initializers appear only when their
+body contains direct executable work or scored definition-time expressions;
+an empty `__init__.py`, a docstring, `pass`, and declarations by themselves add
+no boundary tax. Python `control_decisions` counts `if` and `elif`, loops,
+conditional expressions, `match`, match guards, comprehension generators and
+filters, and exception handlers. A `with` item is an expression operation, not
+a decision. Assignment, augmented assignment, deletion, and walrus expressions
+are also exposed as mutation signals.
+
+In both languages, `call_sites` counts ordinary and method calls,
+`explicit_parameters` excludes a method receiver, and `match_arms` counts every
+arm or case. Direct Python methods exclude a leading `self` or `cls` unless the
+method is a `staticmethod`. The score is intentionally linear and unbounded, so
+its units are easy to audit and compare without a hidden normalization step.
+
+Nested named functions, closures, and lambdas own their bodies exclusively. The
+enclosing unit still reports that a closure exists, but decisions, statements,
+calls, and nesting inside the nested body are scored in that body's own report.
+Rust named functions and initializer units start at depth zero, while closures
+keep their surrounding lexical control-flow depth. Python nested functions and
+lambdas also keep that depth because they can be declared inside control flow;
+moving a branch into an immediately-created callable therefore does not erase
+its nesting context. Definition-time decorators, defaults, annotations, bases,
+and class keywords remain in the enclosing initializer. A file's
 `burden` is the sum of its callable
 `score.value` fields, and the repository `summary.burden` sums file burdens with
 production and test values kept separate. These aggregates make a file with
 several moderate hotspots visible alongside an individual worst callable.
 
 The weights are transparent, provisional hypotheses about reading and changing
-Rust. The `expression_operations` charge is a provisional 0.1-point weight per
+Rust and Python. The `expression_operations` charge is a provisional 0.1-point weight per
 operation; it has no claim to be empirically optimal or to predict developer
 time. A larger score is not automatically a defect. The checked-in corpus is a
 structural regression and guardrail suite: it contains 13 subjective clarity
@@ -215,7 +237,7 @@ Text output also ranks files by their additive production and test burdens, and
 shows each file's callable count and highest callable score so concentration is
 visible without a per-file tax. Moving a callable between files leaves the
 repository sum unchanged when the callable and its score are unchanged. These
-file rows are an aggregation view, not a claim that a file is a semantic Rust
+file rows are an aggregation view, not a claim that a file is a semantic
 module; module boundaries, name resolution, and coupling burden remain future
 analysis work.
 Macro expansion, type resolution, generated functions, and conditional
@@ -238,37 +260,49 @@ identifier is retained as the stable identity of this formula.
 
 ## Token semantics
 
-The `Tokens` value is a Rust lexical token count for the complete function
-source span, from its visibility (when present) and signature through its body.
-Outer attributes are outside that span. Whitespace and ordinary or
-documentation comments are excluded;
-identifiers, keywords, literals, punctuation, and opening and closing
-delimiters each count once. A string or raw string literal is one token, and
-macro invocation contents are counted as written without expanding the macro.
+The `Tokens` value is a language-specific lexical token count for the complete
+callable source span. It is a stable size signal within one language, rather
+than a tokenizer-independent value intended for cross-language comparison.
+
+For Rust, the span runs from visibility (when present) and signature through the
+body, with outer attributes excluded. Whitespace and ordinary or documentation
+comments are excluded; identifiers, keywords, literals, punctuation, and
+opening and closing delimiters each count once. A string or raw string literal
+is one token, and macro invocation contents are counted as written without
+expanding the macro.
 
 Multi-character punctuation is deliberately frozen as one punctuation token
 per character: `->` counts as two, `::` as two, and `..=` as three. These are
-Rust lexical tokens in Kompass's terminology, not LLM or model tokens. The file
-total is produced by lexing the complete file once, so it is not the sum of
-overlapping nested function spans.
+Rust lexical tokens in Kompass's terminology, not LLM or model tokens. Python
+uses Ruff's lexical stream and excludes comments, newlines, indentation,
+dedentation, and the end marker; docstrings remain string tokens. Both file
+totals come from lexing the complete file once, so they are not the sum of
+overlapping callable spans. Python input must be UTF-8 without a byte-order mark;
+unsupported encodings are reported as read errors and make coverage partial.
 
 ## What gets analyzed
 
 At a Cargo manifest root Kompass asks Cargo for workspace packages, walks each
-package root, and uses Cargo's target kinds to classify integration tests and
-benchmarks. A standalone directory is walked recursively in deterministic
-order. Build output, Git metadata, Cargo metadata, vendored dependencies, and
-Node modules are skipped. Tests are measured with the same score,
-then classified separately when they are definite `#[cfg(test)]` module
-contents, `#[test]` or known async-test functions, or Cargo test/benchmark
-targets. A directory named `tests` has no special meaning in a standalone tree
-without Cargo target or syntax context.
+package root for Rust sources, and uses Cargo's target kinds to classify
+integration tests and benchmarks. Python files are walked from the requested
+root, including scripts outside Cargo package roots. A standalone directory is
+walked recursively in deterministic order. Build output, Git metadata, Cargo
+metadata, vendored dependencies, Node modules, `.venv`, `venv`, `__pycache__`,
+`.tox`, `.nox`, and directories containing `pyvenv.cfg` are skipped, while
+`.gitignore` and `.ignore` rules are respected. An explicit source file is
+always analyzed even when it is ignored or outside the selected language.
 
-The parser is `syn`, and analysis is performed on the source that is present on
-disk. Macro expansion, type resolution, generated functions, and configuration
-evaluation are outside v0.1, so they are not silently presented as measured
-complexity. A source file that cannot be read, lexed, or parsed appears in the
-report's `errors` list and reduces the reported coverage.
+Python files are classified as tests when any path component is `tests`, the
+file is named `test_*.py`, `*_test.py`, or `conftest.py`. Rust tests retain the
+existing Cargo and syntax-level classification. `--language` filters directory
+walks and defaults to `all`; it does not override an explicit file.
+
+Rust parsing uses `syn` and Python parsing uses the Ruff Python frontend with
+the Python 3.14 grammar; analysis is performed on the source that is present on disk. Macro expansion,
+type resolution, generated functions, and configuration evaluation are outside
+v0.1, so they are not silently presented as measured complexity. A source file
+that cannot be read, lexed, or parsed appears in the report's `errors` list and
+reduces the reported coverage.
 
 ## Development
 

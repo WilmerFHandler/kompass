@@ -9,17 +9,34 @@ use syn::{Attribute, FnArg, ItemConst, ItemFn, ItemMod, ItemStatic, Meta, Token}
 
 use crate::discover::{DiscoveredFile, Discovery};
 use crate::model::{
-    AnalysisError, Burden, Category, CategorySummary, Coverage, ErrorKind, FileReport,
-    FunctionKind, FunctionReport, LineCounts, Location, MacroOpacity, Position, Report,
-    SCORE_MODEL, Summary,
+    AnalysisContract, AnalysisError, Burden, Category, CategorySummary, Coverage, ErrorKind,
+    FileAnalysis, FileReport, FunctionKind, FunctionReport, Language, LineCounts, Location,
+    MacroOpacity, Position, Report, SCORE_MODEL, Summary,
 };
 use crate::score;
 use crate::tokens::{self, LexedSource, TokenPosition};
+
+/// Callback contract for the Python frontend. The frontend owns parsing and
+/// metric collection; the analyzer owns path/category metadata and aggregate
+/// reporting. A string error is converted to a parse error for the file.
+pub type PythonAnalyzer =
+    fn(path: &Path, source: &str, category: Category) -> Result<FileAnalysis, String>;
 
 /// Analyze each discovered source file independently. A file that cannot be
 /// read, lexed, or parsed is recorded as an error while successful files still
 /// produce a useful partial report.
 pub fn analyze(input: &Path, discovered: Discovery) -> Report {
+    analyze_with_frontends(input, discovered, Some(crate::python::analyze_file))
+}
+
+/// Analyze each discovered file with an optional Python frontend. Keeping the
+/// callback at this seam lets the Ruff-backed `python` module evolve without
+/// coupling discovery, reporting, or the Rust frontend to its AST types.
+pub fn analyze_with_frontends(
+    input: &Path,
+    discovered: Discovery,
+    python_analyzer: Option<PythonAnalyzer>,
+) -> Report {
     let canonical_input = fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());
     let root = if canonical_input.is_file() {
         canonical_input
@@ -31,11 +48,29 @@ pub fn analyze(input: &Path, discovered: Discovery) -> Report {
     };
 
     let test_context_files = discover_test_context_files(&discovered.files);
+    let mut test_files = discovered
+        .files
+        .iter()
+        .filter(|file| file.category == Category::Test)
+        .map(|file| file.path.clone())
+        .collect::<BTreeSet<_>>();
+    test_files.extend(test_context_files.iter().cloned());
     let mut files = Vec::new();
     let mut errors = Vec::new();
 
-    for DiscoveredFile { path, is_test } in discovered.files {
-        let is_test = is_test || test_context_files.contains(&path);
+    for DiscoveredFile {
+        path,
+        language,
+        category,
+    } in discovered.files
+    {
+        // Rust module reachability can promote a discovered source file to a
+        // test-only unit. Python classification comes entirely from discovery.
+        let category = if language == Language::Rust && test_context_files.contains(&path) {
+            Category::Test
+        } else {
+            category
+        };
         let display_path = display_path(&path, &root);
         let source = match fs::read_to_string(&path) {
             Ok(source) => source,
@@ -49,41 +84,42 @@ pub fn analyze(input: &Path, discovered: Discovery) -> Report {
             }
         };
 
-        let line_analysis = classify_lines(&source);
-        let lines = line_analysis.counts.clone();
-        let syntax = match syn::parse_file(&source) {
-            Ok(file) => file,
-            Err(error) => {
-                errors.push(AnalysisError {
-                    path: Some(display_path),
+        let file_analysis = match language {
+            Language::Rust => analyze_rust_file(&source, category == Category::Test),
+            Language::Python => match python_analyzer {
+                Some(analyzer) => {
+                    analyzer(&path, &source, category).map_err(|message| AnalysisError {
+                        path: None,
+                        kind: ErrorKind::Parse,
+                        message,
+                    })
+                }
+                None => Err(AnalysisError {
+                    path: None,
                     kind: ErrorKind::Parse,
-                    message: error.to_string(),
-                });
+                    message:
+                        "Python frontend is unavailable; build Kompass with the Python frontend"
+                            .to_owned(),
+                }),
+            },
+        };
+        let file_analysis = match file_analysis {
+            Ok(file_analysis) => file_analysis,
+            Err(mut error) => {
+                error.path = Some(display_path);
+                errors.push(error);
                 continue;
             }
         };
-        let lexed = match tokens::lex(&source) {
-            Ok(lexed) => lexed,
-            Err(error) => {
-                errors.push(AnalysisError {
-                    path: Some(display_path),
-                    kind: ErrorKind::Lex,
-                    message: error,
-                });
-                continue;
-            }
-        };
-
-        let collected = collect_functions(&syntax, &lexed, &line_analysis, is_test);
-        let burden = summarize_burden(&collected.functions);
-        let macro_opacity = measure_macro_opacity(&syntax, &lexed);
+        let burden = summarize_burden(&file_analysis.functions);
         files.push(FileReport {
             path: display_path,
-            lines,
-            tokens: lexed.total_tokens(),
-            functions: collected.functions,
+            language,
+            lines: file_analysis.lines,
+            tokens: file_analysis.tokens,
+            functions: file_analysis.functions,
             burden,
-            macro_opacity,
+            macro_opacity: file_analysis.macro_opacity,
         });
     }
 
@@ -107,7 +143,7 @@ pub fn analyze(input: &Path, discovered: Discovery) -> Report {
         discovered_files: analyzed_files + failed_files,
         analyzed_files,
         failed_files,
-        test_files: test_context_files.len(),
+        test_files: test_files.len(),
         complete: failed_files == 0,
     };
 
@@ -115,6 +151,7 @@ pub fn analyze(input: &Path, discovered: Discovery) -> Report {
         tool: "kompass".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         model: SCORE_MODEL.to_owned(),
+        analysis_contract: AnalysisContract::current(),
         root: root.to_string_lossy().into_owned(),
         summary,
         coverage,
@@ -124,6 +161,27 @@ pub fn analyze(input: &Path, discovered: Discovery) -> Report {
     }
 }
 
+fn analyze_rust_file(source: &str, file_is_test: bool) -> Result<FileAnalysis, AnalysisError> {
+    let line_analysis = classify_lines(source);
+    let syntax = syn::parse_file(source).map_err(|error| AnalysisError {
+        path: None,
+        kind: ErrorKind::Parse,
+        message: error.to_string(),
+    })?;
+    let lexed = tokens::lex(source).map_err(|error| AnalysisError {
+        path: None,
+        kind: ErrorKind::Lex,
+        message: error,
+    })?;
+    let collected = collect_functions(&syntax, &lexed, &line_analysis, file_is_test);
+    Ok(FileAnalysis {
+        lines: line_analysis.counts,
+        tokens: lexed.total_tokens(),
+        functions: collected.functions,
+        macro_opacity: measure_macro_opacity(&syntax, &lexed),
+    })
+}
+
 /// Resolve test-only external modules while preserving production reachability.
 /// `syn` parses each file independently, so this pass builds the small module
 /// graph needed to carry `cfg(test)` context across conventional Rust files.
@@ -131,9 +189,14 @@ fn discover_test_context_files(discovered: &[DiscoveredFile]) -> BTreeSet<PathBu
     let mut known_files = BTreeSet::new();
     let mut cargo_test_roots = BTreeMap::new();
     for file in discovered {
+        if file.language != Language::Rust {
+            continue;
+        }
         let path = file.path.clone();
         known_files.insert(path.clone());
-        cargo_test_roots.entry(path).or_insert(file.is_test);
+        cargo_test_roots
+            .entry(path)
+            .or_insert(file.category == Category::Test);
     }
 
     let (edges, incoming) = collect_module_edges(&known_files);
@@ -310,6 +373,12 @@ fn summarize(files: &[FileReport]) -> Summary {
     for file in files {
         summary.code_lines += file.lines.code;
         summary.tokens += file.tokens;
+        match file.language {
+            Language::Rust => summary.languages.rust = summary.languages.rust.saturating_add(1),
+            Language::Python => {
+                summary.languages.python = summary.languages.python.saturating_add(1)
+            }
+        }
         for function in &file.functions {
             match function.category {
                 Category::Production => production.push(function),
@@ -1259,6 +1328,7 @@ mod tests {
         let collection = collect_functions(&syntax, &lexed, &line_analysis, false);
         let file = FileReport {
             path: "src/lib.rs".to_owned(),
+            language: Language::Rust,
             lines: line_analysis.counts.clone(),
             tokens: lexed.total_tokens(),
             functions: collection.functions,
@@ -1270,6 +1340,7 @@ mod tests {
             tool: "kompass".to_owned(),
             version: "0.1.0".to_owned(),
             model: SCORE_MODEL.to_owned(),
+            analysis_contract: AnalysisContract::current(),
             root: "/tmp".to_owned(),
             summary,
             coverage: Coverage {
@@ -1571,15 +1642,18 @@ mod tests {
                 files: vec![
                     DiscoveredFile {
                         path: lib_path,
-                        is_test: false,
+                        language: Language::Rust,
+                        category: Category::Production,
                     },
                     DiscoveredFile {
                         path: helper_path,
-                        is_test: false,
+                        language: Language::Rust,
+                        category: Category::Production,
                     },
                     DiscoveredFile {
                         path: nested_path,
-                        is_test: false,
+                        language: Language::Rust,
+                        category: Category::Production,
                     },
                 ],
                 test_files: 0,
@@ -1629,15 +1703,18 @@ mod tests {
                 files: vec![
                     DiscoveredFile {
                         path: lib_path,
-                        is_test: false,
+                        language: Language::Rust,
+                        category: Category::Production,
                     },
                     DiscoveredFile {
                         path: shared_path,
-                        is_test: false,
+                        language: Language::Rust,
+                        category: Category::Production,
                     },
                     DiscoveredFile {
                         path: test_only_path,
-                        is_test: false,
+                        language: Language::Rust,
+                        category: Category::Production,
                     },
                 ],
                 test_files: 0,
@@ -1697,19 +1774,23 @@ mod tests {
                 files: vec![
                     DiscoveredFile {
                         path: lib_path,
-                        is_test: false,
+                        language: Language::Rust,
+                        category: Category::Production,
                     },
                     DiscoveredFile {
                         path: production_path,
-                        is_test: false,
+                        language: Language::Rust,
+                        category: Category::Production,
                     },
                     DiscoveredFile {
                         path: test_root_path,
-                        is_test: false,
+                        language: Language::Rust,
+                        category: Category::Production,
                     },
                     DiscoveredFile {
                         path: cycle_path,
-                        is_test: false,
+                        language: Language::Rust,
+                        category: Category::Production,
                     },
                 ],
                 test_files: 0,
@@ -1884,7 +1965,8 @@ mod tests {
             Discovery {
                 files: vec![DiscoveredFile {
                     path: path.clone(),
-                    is_test: false,
+                    language: Language::Rust,
+                    category: Category::Production,
                 }],
                 test_files: 0,
             },

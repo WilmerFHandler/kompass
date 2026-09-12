@@ -3,7 +3,8 @@ use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 
 use crate::model::{
-    Category, CategorySummary, ErrorKind, FunctionReport, OutputFormat, Report, SortBy,
+    Category, CategorySummary, ErrorKind, FunctionReport, Language, LanguageCounts, OutputFormat,
+    Report, SortBy,
 };
 
 pub fn write_report(
@@ -43,8 +44,10 @@ fn render_text(report: &Report, top: usize, tests: bool, all: bool, sort: SortBy
     let mut output = String::new();
     writeln!(
         output,
-        "Kompass {} · Rust structural complexity · {}",
-        report.version, report.model
+        "Kompass {} · {} structural complexity · {}",
+        report.version,
+        language_header(report),
+        report.model
     )
     .unwrap();
     writeln!(output, "{}", report.root).unwrap();
@@ -52,6 +55,13 @@ fn render_text(report: &Report, top: usize, tests: bool, all: bool, sort: SortBy
         output,
         "{} files · {} code lines · {} tokens",
         report.summary.files, report.summary.code_lines, report.summary.tokens
+    )
+    .unwrap();
+    let languages = effective_language_counts(report);
+    writeln!(
+        output,
+        "Languages · {} Rust files · {} Python files",
+        languages.rust, languages.python
     )
     .unwrap();
     render_category_summary(&mut output, "Production", &report.summary.production);
@@ -93,7 +103,7 @@ fn render_text(report: &Report, top: usize, tests: bool, all: bool, sort: SortBy
     if report.coverage.test_files > 0 {
         writeln!(
             output,
-            "Test files · {} Cargo or cfg(test) source files",
+            "Test files · {} source files",
             report.coverage.test_files
         )
         .unwrap();
@@ -126,19 +136,20 @@ fn render_text(report: &Report, top: usize, tests: bool, all: bool, sort: SortBy
 
     if report.summary.files == 0 && report.coverage.discovered_files == 0 {
         output.push('\n');
-        writeln!(output, "No Rust source files found.").unwrap();
+        writeln!(output, "No source files found.").unwrap();
     } else if !has_selected_functions {
         output.push('\n');
         writeln!(
             output,
-            "No {} callables found in the analyzed Rust files.",
+            "No {} callables found in the analyzed {} files.",
             if all {
                 "production or test"
             } else if tests {
                 "test"
             } else {
                 "production"
-            }
+            },
+            language_header(report)
         )
         .unwrap();
     }
@@ -160,6 +171,29 @@ fn render_text(report: &Report, top: usize, tests: bool, all: bool, sort: SortBy
     }
 
     output
+}
+
+fn effective_language_counts(report: &Report) -> LanguageCounts {
+    if report.summary.languages.rust != 0 || report.summary.languages.python != 0 {
+        return report.summary.languages.clone();
+    }
+    let mut counts = LanguageCounts::default();
+    for file in &report.files {
+        match file.language {
+            Language::Rust => counts.rust = counts.rust.saturating_add(1),
+            Language::Python => counts.python = counts.python.saturating_add(1),
+        }
+    }
+    counts
+}
+
+fn language_header(report: &Report) -> &'static str {
+    let languages = effective_language_counts(report);
+    match (languages.rust > 0, languages.python > 0) {
+        (true, false) => "Rust",
+        (false, true) => "Python",
+        _ => "Mixed-language",
+    }
 }
 
 fn compare_functions(
@@ -234,12 +268,13 @@ fn render_file_burdens(output: &mut String, report: &Report, top: usize) {
             .unwrap_or(0);
         writeln!(
             output,
-            "  {:>5}  {} callables · highest {} · {} production · {} tests · {}",
+            "  {:>5}  {} callables · highest {} · {} production · {} tests · {} · {}",
             format_score(file.burden.total),
             callable_count,
             format_score(highest_callable),
             format_score(file.burden.production),
             format_score(file.burden.test),
+            file.language.label(),
             file.path
         )
         .unwrap();
@@ -326,8 +361,8 @@ fn error_kind_name(kind: &ErrorKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::model::{
-        Burden, Coverage, FileReport, FunctionKind, Location, MacroOpacity, Metrics, Position,
-        SCORE_MODEL, Score, Summary,
+        AnalysisContract, Burden, Coverage, FileReport, FunctionKind, Language, Location,
+        MacroOpacity, Metrics, Position, SCORE_MODEL, Score, Summary,
     };
 
     #[test]
@@ -336,11 +371,13 @@ mod tests {
             tool: "kompass".to_owned(),
             version: "0.1.0".to_owned(),
             model: SCORE_MODEL.to_owned(),
+            analysis_contract: AnalysisContract::current(),
             root: "/tmp/project".to_owned(),
             summary: Summary {
                 files: 1,
                 code_lines: 4,
                 tokens: 12,
+                languages: Default::default(),
                 production: CategorySummary {
                     functions: 1,
                     total_score: 50,
@@ -364,6 +401,7 @@ mod tests {
             macro_opacity: MacroOpacity::default(),
             files: vec![FileReport {
                 path: "src/lib.rs".to_owned(),
+                language: Language::Rust,
                 lines: Default::default(),
                 tokens: 12,
                 functions: vec![FunctionReport {
@@ -448,6 +486,7 @@ mod tests {
             tool: "kompass".to_owned(),
             version: "0.1.0".to_owned(),
             model: SCORE_MODEL.to_owned(),
+            analysis_contract: AnalysisContract::current(),
             root: "/tmp/project".to_owned(),
             summary: Summary {
                 files: 2,
@@ -467,6 +506,7 @@ mod tests {
             files: vec![
                 FileReport {
                     path: "z.rs".to_owned(),
+                    language: Language::Rust,
                     lines: Default::default(),
                     tokens: 20,
                     functions: vec![function("zeta", 10, 2, 20)],
@@ -475,6 +515,7 @@ mod tests {
                 },
                 FileReport {
                     path: "a.rs".to_owned(),
+                    language: Language::Rust,
                     lines: Default::default(),
                     tokens: 30,
                     functions: vec![function("alpha", 1, 2, 30), function("beta", 5, 3, 10)],

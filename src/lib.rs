@@ -5,7 +5,8 @@ pub mod diff;
 pub mod discover;
 pub mod model;
 pub mod output;
+pub mod python;
 pub mod score;
 pub mod tokens;
 
-pub use model::{OutputFormat, Report, SortBy};
+pub use model::{AnalysisContract, FileAnalysis, Language, OutputFormat, Report, SortBy};
