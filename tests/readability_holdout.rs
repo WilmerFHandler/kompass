@@ -14,7 +14,7 @@ const BEFORE_SOURCE: &str = include_str!("fixtures/readability/holdout_before.rs
 const AFTER_SOURCE: &str = include_str!("fixtures/readability/holdout_after.rs");
 
 #[test]
-fn held_out_guard_clauses_preserve_trace_and_reduce_v3_burden() {
+fn held_out_guard_clauses_preserve_trace_and_reduce_burden() {
     for a in [false, true] {
         for b in [false, true] {
             for c in [false, true] {
@@ -30,11 +30,11 @@ fn held_out_guard_clauses_preserve_trace_and_reduce_v3_burden() {
     let before_score = support::function_snapshot(BEFORE_SOURCE, "evaluate");
     let after_score = support::function_snapshot(AFTER_SOURCE, "evaluate");
     support::print_comparison("holdout-evaluate", before_score, after_score);
-    assert!(after_score.v3_units < before_score.v3_units);
+    assert!(after_score.units < before_score.units);
 }
 
 #[test]
-fn held_out_match_binding_preserves_every_byte_value_and_v3_cost() {
+fn held_out_match_binding_preserves_every_byte_value_and_score() {
     for value in u8::MIN..=u8::MAX {
         assert_eq!(
             before::classify(value),
@@ -46,7 +46,7 @@ fn held_out_match_binding_preserves_every_byte_value_and_v3_cost() {
     let before_score = support::function_snapshot(BEFORE_SOURCE, "classify");
     let after_score = support::function_snapshot(AFTER_SOURCE, "classify");
     support::print_comparison("holdout-classify", before_score, after_score);
-    assert_eq!(before_score.v3_units, after_score.v3_units);
+    assert_eq!(before_score.units, after_score.units);
 }
 
 #[test]
@@ -62,11 +62,11 @@ fn held_out_closure_and_named_helper_have_equal_aggregate_cost() {
     let before_score = support::selected_snapshot(BEFORE_SOURCE, &["transform"]);
     let after_score = support::selected_snapshot(AFTER_SOURCE, &["transform"]);
     support::print_comparison("holdout-transform", before_score, after_score);
-    assert_eq!(before_score.v3_units, after_score.v3_units);
+    assert_eq!(before_score.units, after_score.units);
 }
 
 #[test]
-fn held_out_named_arithmetic_preserves_checked_range_and_v3_cost() {
+fn held_out_named_arithmetic_preserves_checked_range_and_score() {
     for a in -20_i16..=20 {
         for b in -20_i16..=20 {
             for c in -20_i16..=20 {
@@ -82,5 +82,5 @@ fn held_out_named_arithmetic_preserves_checked_range_and_v3_cost() {
     let before_score = support::function_snapshot(BEFORE_SOURCE, "calculate");
     let after_score = support::function_snapshot(AFTER_SOURCE, "calculate");
     support::print_comparison("holdout-calculate", before_score, after_score);
-    assert_eq!(before_score.v3_units, after_score.v3_units);
+    assert_eq!(before_score.units, after_score.units);
 }

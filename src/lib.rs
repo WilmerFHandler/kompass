@@ -7,5 +7,4 @@ pub mod output;
 pub mod score;
 pub mod tokens;
 
-pub use analyze::AnalysisOptions;
-pub use model::{OutputFormat, Report, ScoringModel, SortBy};
+pub use model::{OutputFormat, Report, SortBy};

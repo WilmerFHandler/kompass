@@ -125,7 +125,7 @@ fn deduplicated_callers_preserve_behavior() {
 }
 
 #[test]
-fn subjective_readability_cases_report_reproducible_v2_and_v3_deltas() {
+fn subjective_readability_cases_report_reproducible_score_deltas() {
     // These rows are preferences to review with humans. The test records the
     // formula's response without asserting that every style preference is a
     // universal readability truth.
@@ -145,8 +145,8 @@ fn subjective_readability_cases_report_reproducible_v2_and_v3_deltas() {
     let useful_after = support::selected_snapshot(AFTER_SOURCE, &["in_range", "useful_extraction"]);
     support::print_comparison("useful-extraction", useful_before, useful_after);
     assert!(
-        useful_after.v3_units < useful_before.v3_units,
-        "the extracted nested subtree should reduce aggregate v3 burden"
+        useful_after.units < useful_before.units,
+        "the extracted nested subtree should reduce aggregate burden"
     );
 
     let wrapper_before = support::selected_snapshot(BEFORE_SOURCE, &["pointless_wrapper"]);
@@ -154,8 +154,8 @@ fn subjective_readability_cases_report_reproducible_v2_and_v3_deltas() {
         support::selected_snapshot(AFTER_SOURCE, &["apply_offset", "pointless_wrapper"]);
     support::print_comparison("pointless-wrapper", wrapper_before, wrapper_after);
     assert!(
-        wrapper_after.v3_units > wrapper_before.v3_units,
-        "a pointless forwarding helper should increase aggregate v3 burden"
+        wrapper_after.units > wrapper_before.units,
+        "a pointless forwarding helper should increase aggregate burden"
     );
 
     let duplicates_before =
@@ -168,31 +168,26 @@ fn subjective_readability_cases_report_reproducible_v2_and_v3_deltas() {
 }
 
 #[test]
-fn structural_invariants_keep_v3_cost_stable() {
+fn structural_invariants_keep_score_stable() {
     let before_formatting = support::function_snapshot(BEFORE_SOURCE, "formatting");
     let after_formatting = support::function_snapshot(AFTER_SOURCE, "formatting");
     assert_eq!(
-        before_formatting.v3_units, after_formatting.v3_units,
-        "formatting-only change should preserve v3 cost"
+        before_formatting.units, after_formatting.units,
+        "formatting-only change should preserve score"
     );
 
     let before_names = support::function_snapshot(BEFORE_SOURCE, "named_intermediates");
     let after_names = support::function_snapshot(AFTER_SOURCE, "named_intermediates");
-    assert!(
-        after_names.v2_units > before_names.v2_units,
-        "v2 statement term should expose the named-intermediate defect"
-    );
     assert_eq!(
-        before_names.v3_units, after_names.v3_units,
-        "v3 should leave free bindings out of the cost"
+        before_names.units, after_names.units,
+        "free bindings should remain outside the score"
     );
 
     let before_arithmetic = support::function_snapshot(BEFORE_SOURCE, "branch_free");
     let after_arithmetic = support::function_snapshot(AFTER_SOURCE, "branch_free");
-    assert!(after_arithmetic.v2_units > before_arithmetic.v2_units);
     assert_eq!(
-        before_arithmetic.v3_units, after_arithmetic.v3_units,
-        "equivalent arithmetic should have the same v3 operation count"
+        before_arithmetic.units, after_arithmetic.units,
+        "equivalent arithmetic should have the same operation count"
     );
     assert!(after_arithmetic.tokens > before_arithmetic.tokens);
 
@@ -200,62 +195,8 @@ fn structural_invariants_keep_v3_cost_stable() {
     let after_left = support::aggregate_snapshot(REDISTRIBUTION_AFTER_LEFT_SOURCE);
     let after_right = support::aggregate_snapshot(REDISTRIBUTION_AFTER_RIGHT_SOURCE);
     assert_eq!(
-        before_files.v3_units,
-        after_left.v3_units + after_right.v3_units,
-        "moving callables between files must preserve additive v3 burden"
+        before_files.units,
+        after_left.units + after_right.units,
+        "moving callables between files must preserve additive burden"
     );
-    assert_eq!(
-        before_files.v2_units,
-        after_left.v2_units + after_right.v2_units,
-        "moving callables between files must preserve additive v2 burden"
-    );
-}
-
-#[test]
-fn coefficient_sensitivity_is_a_diagnostic_over_predeclared_cases() {
-    // This diagnostic compares 0, 1, 2, and 5 tenths per expression
-    // operation. It is deliberately not used to select the v3 coefficient or
-    // to claim human calibration; the regression assertions above own the
-    // actual behavior and invariance contract.
-    let cases = [
-        (
-            "guard-clauses",
-            support::function_snapshot(BEFORE_SOURCE, "guard_clauses"),
-            support::function_snapshot(AFTER_SOURCE, "guard_clauses"),
-        ),
-        (
-            "named-intermediates",
-            support::function_snapshot(BEFORE_SOURCE, "named_intermediates"),
-            support::function_snapshot(AFTER_SOURCE, "named_intermediates"),
-        ),
-        (
-            "useful-extraction",
-            support::selected_snapshot(BEFORE_SOURCE, &["useful_extraction"]),
-            support::selected_snapshot(AFTER_SOURCE, &["in_range", "useful_extraction"]),
-        ),
-        (
-            "branch-free",
-            support::function_snapshot(BEFORE_SOURCE, "branch_free"),
-            support::function_snapshot(AFTER_SOURCE, "branch_free"),
-        ),
-    ];
-
-    for (label, before, after) in cases {
-        let mut previous_before = 0;
-        let mut previous_after = 0;
-        for weight in [0, 1, 2, 5] {
-            let before_units = support::candidate_units(before, weight);
-            let after_units = support::candidate_units(after, weight);
-            eprintln!(
-                "readability/sensitivity/{label}: op-weight {weight}/10 -> {before_units} -> {after_units} (delta {:+})",
-                after_units as isize - before_units as isize
-            );
-            if weight > 0 {
-                assert!(before_units >= previous_before);
-                assert!(after_units >= previous_after);
-            }
-            previous_before = before_units;
-            previous_after = after_units;
-        }
-    }
 }

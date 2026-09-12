@@ -11,20 +11,15 @@ use crate::discover::{DiscoveredFile, Discovery};
 use crate::model::{
     AnalysisError, Burden, Category, CategorySummary, Coverage, ErrorKind, FileReport,
     FunctionKind, FunctionReport, LineCounts, Location, MacroOpacity, Position, Report,
-    ScoringModel, Summary,
+    SCORE_MODEL, Summary,
 };
 use crate::score;
 use crate::tokens::{self, LexedSource, TokenPosition};
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AnalysisOptions {
-    pub model: ScoringModel,
-}
-
 /// Analyze each discovered source file independently. A file that cannot be
 /// read, lexed, or parsed is recorded as an error while successful files still
 /// produce a useful partial report.
-pub fn analyze(input: &Path, discovered: Discovery, options: AnalysisOptions) -> Report {
+pub fn analyze(input: &Path, discovered: Discovery) -> Report {
     let canonical_input = fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());
     let root = if canonical_input.is_file() {
         canonical_input
@@ -79,7 +74,7 @@ pub fn analyze(input: &Path, discovered: Discovery, options: AnalysisOptions) ->
             }
         };
 
-        let collected = collect_functions(&syntax, &lexed, &line_analysis, is_test, options.model);
+        let collected = collect_functions(&syntax, &lexed, &line_analysis, is_test);
         let burden = summarize_burden(&collected.functions);
         let macro_opacity = measure_macro_opacity(&syntax, &lexed);
         files.push(FileReport {
@@ -119,7 +114,7 @@ pub fn analyze(input: &Path, discovered: Discovery, options: AnalysisOptions) ->
     Report {
         tool: "kompass".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        model: options.model.label().to_owned(),
+        model: SCORE_MODEL.to_owned(),
         root: root.to_string_lossy().into_owned(),
         summary,
         coverage,
@@ -435,7 +430,6 @@ fn collect_functions(
     lexed: &LexedSource,
     line_analysis: &LineAnalysis,
     file_is_test: bool,
-    model: ScoringModel,
 ) -> Collection {
     let mut collector = FunctionCollector {
         lexed,
@@ -443,7 +437,6 @@ fn collect_functions(
         test_context: file_is_test,
         scopes: Vec::new(),
         function_depth: 0,
-        model,
         functions: Vec::new(),
     };
     collector.visit_file(syntax);
@@ -458,7 +451,6 @@ struct FunctionCollector<'a> {
     test_context: bool,
     scopes: Vec<String>,
     function_depth: usize,
-    model: ScoringModel,
     functions: Vec<FunctionReport>,
 }
 
@@ -485,7 +477,6 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
             FunctionSource {
                 lexed: self.lexed,
                 line_analysis: self.line_analysis,
-                model: self.model,
             },
         ));
 
@@ -547,7 +538,6 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
             FunctionSource {
                 lexed: self.lexed,
                 line_analysis: self.line_analysis,
-                model: self.model,
             },
         ));
 
@@ -579,7 +569,6 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
                 FunctionSource {
                     lexed: self.lexed,
                     line_analysis: self.line_analysis,
-                    model: self.model,
                 },
             ));
         }
@@ -595,13 +584,6 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
     }
 
     fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
-        if self.model == ScoringModel::StructuralV1 {
-            // v1 never exposed closures as function records. Preserve its
-            // existing callable inventory while retaining discovery of any
-            // named items nested in a closure body.
-            visit::visit_expr_closure(self, node);
-            return;
-        }
         let start = node.span().start();
         let name = self.qualified_name(&format!("<closure@{}:{}>", start.line, start.column + 1));
         let code_lines = self
@@ -619,7 +601,6 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
             FunctionSource {
                 lexed: self.lexed,
                 line_analysis: self.line_analysis,
-                model: self.model,
             },
         ));
 
@@ -644,7 +625,6 @@ impl FunctionCollector<'_> {
 struct FunctionSource<'a> {
     lexed: &'a LexedSource,
     line_analysis: &'a LineAnalysis,
-    model: ScoringModel,
 }
 
 fn make_function_report(
@@ -656,7 +636,6 @@ fn make_function_report(
     start_span: proc_macro2::Span,
     function_source: FunctionSource<'_>,
 ) -> FunctionReport {
-    let model = function_source.model;
     let start = start_span.start();
     let end = block.span().end();
     let start_position = Position {
@@ -673,12 +652,7 @@ fn make_function_report(
     let code_lines = function_source
         .line_analysis
         .code_lines_in_range(start.line, end.line);
-    let mut metrics = match model {
-        ScoringModel::StructuralV1 => score::measure(block, code_lines, parameters),
-        ScoringModel::StructuralV2 | ScoringModel::StructuralV3 => {
-            score::measure_exclusive(block, code_lines, parameters, explicit_parameters)
-        }
-    };
+    let mut metrics = score::measure(block, code_lines, parameters, explicit_parameters);
     metrics.mutations += mutable_parameter_count(signature);
     let token_count = function_source.lexed.tokens_in(
         TokenPosition {
@@ -701,7 +675,7 @@ fn make_function_report(
         },
         lines,
         tokens: token_count,
-        score: score::score_for_model(&metrics, model),
+        score: score::score(&metrics),
         metrics,
     }
 }
@@ -713,7 +687,6 @@ fn make_closure_report(
     code_lines: usize,
     function_source: FunctionSource<'_>,
 ) -> FunctionReport {
-    let model = function_source.model;
     let span = closure.span();
     let start = span.start();
     let end = span.end();
@@ -746,7 +719,7 @@ fn make_closure_report(
         },
         lines: end.line.saturating_sub(start.line) + 1,
         tokens: token_count,
-        score: score::score_for_model(&metrics, model),
+        score: score::score(&metrics),
         metrics,
     }
 }
@@ -1112,13 +1085,7 @@ mod tests {
         let lexed = tokens::lex(source).unwrap();
         let syntax = syn::parse_file(source).unwrap();
         let line_analysis = classify_lines(source);
-        let collection = collect_functions(
-            &syntax,
-            &lexed,
-            &line_analysis,
-            false,
-            ScoringModel::StructuralV1,
-        );
+        let collection = collect_functions(&syntax, &lexed, &line_analysis, false);
         let file = FileReport {
             path: "src/lib.rs".to_owned(),
             lines: line_analysis.counts.clone(),
@@ -1131,7 +1098,7 @@ mod tests {
         Report {
             tool: "kompass".to_owned(),
             version: "0.1.0".to_owned(),
-            model: ScoringModel::StructuralV1.label().to_owned(),
+            model: SCORE_MODEL.to_owned(),
             root: "/tmp".to_owned(),
             summary,
             coverage: Coverage {
@@ -1144,11 +1111,6 @@ mod tests {
             files: vec![file],
             errors: Vec::new(),
         }
-    }
-
-    #[test]
-    fn analysis_options_default_to_structural_v3() {
-        assert_eq!(AnalysisOptions::default().model, ScoringModel::StructuralV3);
     }
 
     #[test]
@@ -1196,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn test_items_are_classified_without_changing_the_score_model() {
+    fn test_items_are_classified_without_changing_the_score() {
         let source = r#"
             #[cfg(test)]
             mod tests { fn module_test() {} }
@@ -1217,13 +1179,7 @@ mod tests {
         let lexed = tokens::lex(source).unwrap();
         let syntax = syn::parse_file(source).unwrap();
         let line_analysis = classify_lines(source);
-        let collection = collect_functions(
-            &syntax,
-            &lexed,
-            &line_analysis,
-            false,
-            ScoringModel::StructuralV1,
-        );
+        let collection = collect_functions(&syntax, &lexed, &line_analysis, false);
         assert_eq!(collection.functions.len(), 8);
         assert_eq!(
             collection
@@ -1234,13 +1190,7 @@ mod tests {
             5
         );
 
-        let integration = collect_functions(
-            &syntax,
-            &lexed,
-            &line_analysis,
-            true,
-            ScoringModel::StructuralV1,
-        );
+        let integration = collect_functions(&syntax, &lexed, &line_analysis, true);
         assert!(
             integration
                 .functions
@@ -1250,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_reports_closures_and_uses_exclusive_file_burden() {
+    fn reports_closures_and_uses_exclusive_file_burden() {
         let source = r#"
             struct Runner;
             impl Runner {
@@ -1263,13 +1213,7 @@ mod tests {
         let lexed = tokens::lex(source).unwrap();
         let syntax = syn::parse_file(source).unwrap();
         let line_analysis = classify_lines(source);
-        let collection = collect_functions(
-            &syntax,
-            &lexed,
-            &line_analysis,
-            false,
-            ScoringModel::StructuralV2,
-        );
+        let collection = collect_functions(&syntax, &lexed, &line_analysis, false);
         let closure = collection
             .functions
             .iter()
@@ -1286,7 +1230,7 @@ mod tests {
         assert_eq!(method.metrics.call_sites, 1);
         assert_eq!(closure.metrics.control_decisions, 1);
         assert_eq!(closure.metrics.call_sites, 2);
-        assert_eq!(closure.score.value, 10 + 10 + 2 + 2 + 2 + 1);
+        assert_eq!(closure.score.value, 10 + 10 + 2 * 2);
 
         let burden = summarize_burden(&collection.functions);
         assert_eq!(burden.production, method.score.value + closure.score.value);
@@ -1353,7 +1297,6 @@ mod tests {
                 ],
                 test_files: 0,
             },
-            AnalysisOptions::default(),
         );
 
         assert_eq!(report.summary.production.functions, 1);
@@ -1412,7 +1355,6 @@ mod tests {
                 ],
                 test_files: 0,
             },
-            AnalysisOptions::default(),
         );
 
         assert_eq!(report.summary.production.functions, 2);
@@ -1485,7 +1427,6 @@ mod tests {
                 ],
                 test_files: 0,
             },
-            AnalysisOptions::default(),
         );
 
         assert_eq!(report.summary.production.functions, 3);
@@ -1520,13 +1461,7 @@ mod tests {
         let lexed = tokens::lex(source).unwrap();
         let syntax = syn::parse_file(source).unwrap();
         let line_analysis = classify_lines(source);
-        let collection = collect_functions(
-            &syntax,
-            &lexed,
-            &line_analysis,
-            false,
-            ScoringModel::StructuralV1,
-        );
+        let collection = collect_functions(&syntax, &lexed, &line_analysis, false);
         let outer = collection
             .functions
             .iter()
@@ -1666,7 +1601,6 @@ mod tests {
                 }],
                 test_files: 0,
             },
-            AnalysisOptions::default(),
         );
 
         assert!(!report.coverage.complete);

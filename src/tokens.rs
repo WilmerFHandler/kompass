@@ -403,7 +403,7 @@ mod tests {
         let source = lex("fn f<'a>(value: &'a str) -> Option<&'a str> { Some(value) }").unwrap();
 
         // `->`, `&`, `::`-style punctuation, and all delimiters are retained
-        // as individual lexical tokens. The exact total protects the model's
+        // as individual lexical tokens. The exact total protects the score's
         // deliberately frozen convention.
         assert_eq!(source.total_tokens(), 29);
     }

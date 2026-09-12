@@ -1,4 +1,4 @@
-//! Structural regression and guardrail examples for structural-v2.
+//! Structural regression and guardrail examples for the current score.
 //!
 //! These are deliberately original before/after examples rather than a
 //! benchmark copied from another tool. They protect score direction,
@@ -45,7 +45,7 @@ fn explicit_parameters(item: &ItemFn) -> usize {
 
 fn function_score(source: &str) -> usize {
     let item: ItemFn = syn::parse_str(source).expect("corpus function must parse");
-    score::score_v2(&score::measure_exclusive(
+    score::score(&score::measure(
         &item.block,
         0,
         item.sig.inputs.len(),
@@ -62,7 +62,7 @@ struct AggregateScorer {
 
 impl AggregateScorer {
     fn add_function(&mut self, signature: &syn::Signature, block: &syn::Block) {
-        let metrics = score::measure_exclusive(
+        let metrics = score::measure(
             block,
             0,
             signature.inputs.len(),
@@ -72,7 +72,7 @@ impl AggregateScorer {
                 .filter(|input| !matches!(input, FnArg::Receiver(_)))
                 .count(),
         );
-        self.total = self.total.saturating_add(score::score_v2(&metrics).value);
+        self.total = self.total.saturating_add(score::score(&metrics).value);
     }
 }
 
@@ -96,7 +96,7 @@ impl<'ast> Visit<'ast> for AggregateScorer {
 
     fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
         let metrics = score::measure_closure(&node.body, 0, node.inputs.len());
-        self.total = self.total.saturating_add(score::score_v2(&metrics).value);
+        self.total = self.total.saturating_add(score::score(&metrics).value);
         visit::visit_expr_closure(self, node);
     }
 
@@ -414,9 +414,9 @@ const GUARDRAIL_PROBES: &[Pair] = &[
     },
 ];
 
-// Cost-sensitivity probes: these intentionally add arms, calls, statements,
-// parameters, or callable boundaries. A higher score tests formula response,
-// not a claim that the resulting code is less readable.
+// Cost-sensitivity probes: these intentionally add arms, calls, expression
+// operations, parameters, or callable boundaries. A higher score tests formula
+// response, not a claim that the resulting code is less readable.
 const COST_SENSITIVITY_PROBES: &[Pair] = &[
     Pair {
         label: "exhaustive-match",
@@ -440,9 +440,9 @@ const COST_SENSITIVITY_PROBES: &[Pair] = &[
         expectation: Expectation::Higher,
     },
     Pair {
-        label: "straight-line-work",
-        before: "fn prepare(value: Value) { if value.needs_work() { work(value); } }",
-        after: "fn prepare(value: Value) { let one = step_one(value); let two = step_two(one); let three = step_three(two); let four = step_four(three); let five = step_five(four); use_value(five); }",
+        label: "expression-work",
+        before: "fn prepare(value: Value) { use_value(value); }",
+        after: "fn prepare(value: Value) { let one = value + offset; let two = one * scale; let three = two - adjustment; let four = three / divisor; let five = four % limit; use_value(five); }",
         scope: Scope::Function,
         expectation: Expectation::Higher,
     },

@@ -21,8 +21,8 @@ fn help_explains_agent_workflow_and_json_contract() {
     let help = String::from_utf8_lossy(&output.stdout);
 
     for expected in [
-        "kompass --model structural-v3 --format json PATH > before.json",
-        "kompass --model structural-v3 --format json PATH > after.json",
+        "kompass --format json PATH > before.json",
+        "kompass --format json PATH > after.json",
         "behavior-preserving refactor",
         "score comparison cannot",
         "summary.burden.production",
@@ -38,6 +38,7 @@ fn help_explains_agent_workflow_and_json_contract() {
         "--top",
         "--sort",
         "text output only",
+        "top-level `model` values match",
         "coverage.complete",
         "errors",
         "status 0",
@@ -52,6 +53,10 @@ fn help_explains_agent_workflow_and_json_contract() {
             "help is missing {expected:?}\n{help}"
         );
     }
+    assert!(
+        !help.contains("--model"),
+        "legacy model selection remains in help\n{help}"
+    );
 }
 
 #[test]
@@ -96,40 +101,15 @@ fn json_report_contains_separate_categories_and_tokens() {
 }
 
 #[test]
-fn default_model_matches_explicit_v3_and_old_models_remain_selectable() {
-    let root = temporary_directory("default-model");
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(
-        root.join("main.rs"),
-        "fn sample(value: i32) { let _ = value + 1; }\n",
-    )
-    .unwrap();
+fn legacy_model_selection_is_rejected() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args(["--model", "structural-v1"])
+        .output()
+        .unwrap();
 
-    let run = |model: Option<&str>| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kompass"));
-        if let Some(model) = model {
-            command.args(["--model", model]);
-        }
-        command.args(["--format", "json", root.to_str().unwrap()]);
-        command.output().unwrap()
-    };
-
-    let implicit = run(None);
-    let explicit_v3 = run(Some("structural-v3"));
-    assert!(implicit.status.success());
-    assert!(explicit_v3.status.success());
-    let implicit_report: serde_json::Value = serde_json::from_slice(&implicit.stdout).unwrap();
-    let explicit_report: serde_json::Value = serde_json::from_slice(&explicit_v3.stdout).unwrap();
-    assert_eq!(implicit_report, explicit_report);
-
-    for model in ["structural-v1", "structural-v2"] {
-        let output = run(Some(model));
-        assert!(output.status.success());
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(report["model"], model);
-    }
-
-    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unexpected argument '--model'"), "{stderr}");
 }
 
 #[test]
@@ -172,44 +152,8 @@ fn sort_options_are_accepted_and_visible_in_text() {
 }
 
 #[test]
-fn structural_v2_is_explicit_and_keeps_integer_units_in_json() {
-    let root = temporary_directory("v2");
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(
-        root.join("main.rs"),
-        "fn sample(value: bool) { if value && value { println!(\"ok\"); } }\n",
-    )
-    .unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_kompass"))
-        .args([
-            "--model",
-            "structural-v2",
-            "--format",
-            "json",
-            root.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["model"], "structural-v2");
-    let score = &report["files"][0]["functions"][0]["score"];
-    assert!(score["value"].is_u64());
-    assert_eq!(score["value"], score["units"]);
-    assert_eq!(score["display"], "2.9");
-    assert_eq!(report["files"][0]["burden"]["total"], score["value"]);
-    assert_eq!(report["summary"]["burden"]["total"], score["value"]);
-    assert_eq!(report["macro_opacity"]["invocations"], 1);
-    assert_eq!(report["files"][0]["macro_opacity"]["invocations"], 1);
-    assert!(report["macro_opacity"]["source_tokens"].as_u64().unwrap() > 0);
-
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn structural_v3_reports_expression_operation_units_in_json() {
-    let root = temporary_directory("v3-json");
+fn reports_expression_operation_units_in_json() {
+    let root = temporary_directory("score-json");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
         root.join("main.rs"),
@@ -218,13 +162,7 @@ fn structural_v3_reports_expression_operation_units_in_json() {
     .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_kompass"))
-        .args([
-            "--model",
-            "structural-v3",
-            "--format",
-            "json",
-            root.to_str().unwrap(),
-        ])
+        .args(["--format", "json", root.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -233,7 +171,6 @@ fn structural_v3_reports_expression_operation_units_in_json() {
     let function = &report["files"][0]["functions"][0];
     assert_eq!(function["metrics"]["expression_operations"], 2);
     assert_eq!(function["score"]["expression_operation_units"], 2);
-    assert_eq!(function["score"]["statement_penalty"], 0);
     assert_eq!(function["score"]["value"], 14);
     assert_eq!(function["score"]["display"], "1.4");
 
@@ -241,8 +178,8 @@ fn structural_v3_reports_expression_operation_units_in_json() {
 }
 
 #[test]
-fn structural_v3_text_shows_the_exact_operation_breakdown() {
-    let root = temporary_directory("v3-text");
+fn text_shows_the_exact_operation_breakdown() {
+    let root = temporary_directory("score-text");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
         root.join("main.rs"),
@@ -251,7 +188,7 @@ fn structural_v3_text_shows_the_exact_operation_breakdown() {
     .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_kompass"))
-        .args(["--model", "structural-v3", root.to_str().unwrap()])
+        .arg(root.to_str().unwrap())
         .output()
         .unwrap();
     assert!(output.status.success());

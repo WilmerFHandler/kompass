@@ -4,55 +4,29 @@ use syn::{
     ExprReference, ExprUnary, ExprUnsafe, Stmt, UnOp,
 };
 
-use crate::model::{Metrics, Score, ScoringModel};
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum CallableOwnership {
-    /// Retain structural-v1's original inclusive closure traversal.
-    #[default]
-    Inclusive,
-    /// Attribute every callable body to that callable exactly once.
-    Exclusive,
-}
+use crate::model::{Metrics, Score};
 
 /// Measure the structural signals that are available from a Rust syntax
 /// tree without compiling or expanding the crate.
-pub fn measure(block: &syn::Block, code_lines: usize, parameters: usize) -> Metrics {
-    measure_with_ownership(
-        block,
-        code_lines,
-        parameters,
-        parameters,
-        CallableOwnership::Inclusive,
-    )
-}
-
-/// Measure a function body with exclusive callable ownership. Nested named
-/// functions and closures are left to their own reports, so their bodies do
-/// not change the enclosing function's metrics.
-pub fn measure_exclusive(
+pub fn measure(
     block: &syn::Block,
     code_lines: usize,
     parameters: usize,
     explicit_parameters: usize,
 ) -> Metrics {
-    measure_with_ownership(
-        block,
-        code_lines,
-        parameters,
-        explicit_parameters,
-        CallableOwnership::Exclusive,
-    )
+    let mut visitor = MetricsVisitor::default();
+    visitor.metrics.code_lines = code_lines;
+    visitor.metrics.parameters = parameters;
+    visitor.metrics.explicit_parameters = explicit_parameters;
+    visitor.visit_block(block);
+    visitor.metrics
 }
 
 /// Measure a closure body as its own callable. A closure body can be either a
 /// block or a single expression; the latter is one executable statement for
 /// parity with an equivalent function body.
 pub fn measure_closure(body: &Expr, code_lines: usize, explicit_parameters: usize) -> Metrics {
-    let mut visitor = MetricsVisitor {
-        ownership: CallableOwnership::Exclusive,
-        ..MetricsVisitor::default()
-    };
+    let mut visitor = MetricsVisitor::default();
     visitor.metrics.code_lines = code_lines;
     visitor.metrics.parameters = explicit_parameters;
     visitor.metrics.explicit_parameters = explicit_parameters;
@@ -63,68 +37,10 @@ pub fn measure_closure(body: &Expr, code_lines: usize, explicit_parameters: usiz
     visitor.metrics
 }
 
-fn measure_with_ownership(
-    block: &syn::Block,
-    code_lines: usize,
-    parameters: usize,
-    explicit_parameters: usize,
-    ownership: CallableOwnership,
-) -> Metrics {
-    let mut visitor = MetricsVisitor {
-        ownership,
-        ..MetricsVisitor::default()
-    };
-    visitor.metrics.code_lines = code_lines;
-    visitor.metrics.parameters = parameters;
-    visitor.metrics.explicit_parameters = explicit_parameters;
-    visitor.visit_block(block);
-    visitor.metrics
-}
-
-/// Model 1 is intentionally additive and fixed. Every component is an
-/// integer that is emitted with each function, so a score can be explained
-/// without reverse engineering a hidden normalisation step. Tokens are
-/// reported separately: their count is useful context, but does not affect
-/// this model's score.
+/// Score a function using Kompass's current structural model. Scores are
+/// exact integer tenths so JSON and downstream tooling never lose precision;
+/// text output renders those units as a one-decimal value.
 pub fn score(metrics: &Metrics) -> Score {
-    let statement_penalty = metrics.statements / 10;
-    let value = metrics
-        .decisions
-        .saturating_add(metrics.nesting_penalty)
-        .saturating_add(statement_penalty);
-
-    Score {
-        value,
-        units: value,
-        display: value.to_string(),
-        decisions: metrics.decisions,
-        nesting_penalty: metrics.nesting_penalty,
-        statement_penalty,
-        ..Score::default()
-    }
-}
-
-/// Structural-v2 is deliberately linear and transparent. The score is kept
-/// as integer tenths so JSON and downstream tooling never lose precision;
-/// text output can render those units as a one-decimal value.
-pub fn score_v2(metrics: &Metrics) -> Score {
-    score_tenth_model(metrics, metrics.statements, 0)
-}
-
-/// Structural-v3 keeps every structural-v2 charge except the statement
-/// charge. Each counted expression operation contributes one integer tenth.
-pub fn score_v3(metrics: &Metrics) -> Score {
-    score_tenth_model(metrics, 0, metrics.expression_operations)
-}
-
-/// Score the shared integer-tenth components used by structural-v2 and
-/// structural-v3. The model-specific charge is supplied explicitly so v3 is
-/// calculated directly rather than subtracting a saturated v2 score.
-fn score_tenth_model(
-    metrics: &Metrics,
-    statement_units: usize,
-    expression_operation_units: usize,
-) -> Score {
     let boundary: usize = 10;
     let control_decision_units = metrics.control_decisions.saturating_mul(10);
     let nesting_units = metrics.nesting_penalty.saturating_mul(10);
@@ -136,8 +52,7 @@ fn score_tenth_model(
         .saturating_add(control_decision_units)
         .saturating_add(nesting_units)
         .saturating_add(boolean_operator_units)
-        .saturating_add(statement_units)
-        .saturating_add(expression_operation_units)
+        .saturating_add(metrics.expression_operations)
         .saturating_add(call_site_units)
         .saturating_add(parameter_units)
         .saturating_add(match_arm_units);
@@ -150,20 +65,11 @@ fn score_tenth_model(
         decisions: metrics.control_decisions,
         control_decisions: metrics.control_decisions,
         nesting_penalty: metrics.nesting_penalty,
-        statement_penalty: statement_units,
         boolean_operator_units,
         call_site_units,
         parameter_units,
         match_arm_units,
-        expression_operation_units,
-    }
-}
-
-pub fn score_for_model(metrics: &Metrics, model: ScoringModel) -> Score {
-    match model {
-        ScoringModel::StructuralV1 => score(metrics),
-        ScoringModel::StructuralV2 => score_v2(metrics),
-        ScoringModel::StructuralV3 => score_v3(metrics),
+        expression_operation_units: metrics.expression_operations,
     }
 }
 
@@ -171,7 +77,6 @@ pub fn score_for_model(metrics: &Metrics, model: ScoringModel) -> Score {
 struct MetricsVisitor {
     metrics: Metrics,
     depth: usize,
-    ownership: CallableOwnership,
 }
 
 impl MetricsVisitor {
@@ -282,16 +187,11 @@ impl<'ast> Visit<'ast> for MetricsVisitor {
         visit::visit_expr_cast(self, node);
     }
 
-    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+    fn visit_expr_closure(&mut self, _node: &'ast syn::ExprClosure) {
         self.metrics.closures += 1;
-        if self.ownership == CallableOwnership::Inclusive {
-            for input in &node.inputs {
-                self.visit_pat(input);
-            }
-            // This is retained solely for the v1 compatibility path. The
-            // v2 path treats the closure body as an independent callable.
-            self.visit_expr(&node.body);
-        }
+        // Closures are measured as independent callables. Their bodies are
+        // collected and scored separately, so visiting them here would double
+        // count their structural signals in the containing function.
     }
 
     fn visit_arm(&mut self, node: &'ast Arm) {
@@ -394,7 +294,7 @@ mod tests {
 
     fn metrics(source: &str) -> Metrics {
         let item: syn::ItemFn = syn::parse_str(source).unwrap();
-        measure(&item.block, 1, item.sig.inputs.len())
+        measure(&item.block, 1, item.sig.inputs.len(), item.sig.inputs.len())
     }
 
     #[test]
@@ -468,68 +368,21 @@ mod tests {
             "fn f(value: bool) { if value { let check = || if value { true } else { false }; let _ = check; } }",
         );
 
-        assert_eq!(measured.decisions, 2);
-        assert_eq!(measured.nesting_penalty, 1);
-        assert_eq!(measured.max_depth, 2);
+        assert_eq!(measured.decisions, 1);
+        assert_eq!(measured.nesting_penalty, 0);
+        assert_eq!(measured.max_depth, 1);
     }
 
     #[test]
-    fn model_one_is_unbounded_and_ignores_non_structural_signals() {
-        let measured = Metrics {
-            code_lines: 10_000,
-            statements: 29,
-            decisions: 7,
-            nesting_penalty: 11,
-            max_depth: 99,
-            macro_calls: 13,
-            mutations: 100,
-            parameters: 100,
-            closures: 100,
-            unsafe_blocks: 100,
-            match_arms: 100,
-            ..Metrics::default()
-        };
-
-        let scored = score(&measured);
-        assert_eq!(scored.value, 20);
-        assert_eq!(scored.decisions, 7);
-        assert_eq!(scored.nesting_penalty, 11);
-        assert_eq!(scored.statement_penalty, 2);
-    }
-
-    #[test]
-    fn model_two_uses_exact_integer_tenths() {
-        let metrics = Metrics {
-            control_decisions: 2,
-            nesting_penalty: 3,
-            boolean_operators: 2,
-            statements: 7,
-            call_sites: 4,
-            explicit_parameters: 3,
-            match_arms: 5,
-            ..Metrics::default()
-        };
-
-        let scored = score_v2(&metrics);
-        assert_eq!(scored.value, 10 + 20 + 30 + 10 + 7 + 8 + 6 + 10);
-        assert_eq!(scored.units, scored.value);
-        assert_eq!(scored.display, "10.1");
-        assert_eq!(scored.decisions, 2);
-    }
-
-    #[test]
-    fn exclusive_measurement_keeps_closure_body_out_of_parent() {
+    fn measurement_keeps_closure_body_out_of_parent() {
         let item: syn::ItemFn = syn::parse_str(
             "fn f(value: bool) { if value { let check = || if value { call(); } else { other(); }; check(); } }",
         )
         .unwrap();
-        let inclusive = measure(&item.block, 1, 1);
-        let exclusive = measure_exclusive(&item.block, 1, 1, 1);
+        let measured = measure(&item.block, 1, 1, 1);
 
-        assert!(inclusive.control_decisions > exclusive.control_decisions);
-        assert!(inclusive.call_sites > exclusive.call_sites);
-        assert_eq!(exclusive.control_decisions, 1);
-        assert_eq!(exclusive.call_sites, 1);
+        assert_eq!(measured.control_decisions, 1);
+        assert_eq!(measured.call_sites, 1);
     }
 
     #[test]
@@ -541,14 +394,13 @@ mod tests {
     }
 
     #[test]
-    fn expression_operations_count_only_the_v3_nodes() {
+    fn expression_operations_count_only_the_scored_nodes() {
         let measured = metrics(
             "fn f(mut value: i32, index: usize, flag: bool) { let record = value; let field = record.abs; let borrowed = &value; let grouped = (value); let indexed = values[index]; let casted = value as i64; let combined = value + 1; let short = flag && flag || flag; let called = call(value); let dereferenced = *borrowed; let negated = -value; let inverted = !flag; value = combined; value += 1; }",
         );
 
         assert_eq!(measured.expression_operations, 8);
-        assert_eq!(score_v3(&measured).expression_operation_units, 8);
-        assert_eq!(score_v3(&measured).statement_penalty, 0);
+        assert_eq!(score(&measured).expression_operation_units, 8);
     }
 
     #[test]
@@ -556,7 +408,7 @@ mod tests {
         let item: syn::ItemFn =
             syn::parse_str("fn f(value: i32) { let check = || value + 1; let _ = check; }")
                 .unwrap();
-        let parent = measure_exclusive(&item.block, 1, 1, 1);
+        let parent = measure(&item.block, 1, 1, 1);
         let closure: syn::ExprClosure = syn::parse_str("|| value + 1").unwrap();
         let child = measure_closure(&closure.body, 1, closure.inputs.len());
 

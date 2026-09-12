@@ -1,31 +1,7 @@
 use serde::Serialize;
 
-/// The historical identifier for Kompass's first scoring model. The current
-/// default is structural-v3; this constant remains stable for v1 consumers.
-pub const SCORE_MODEL: &str = "structural-v1";
-pub const STRUCTURAL_V1: &str = "structural-v1";
-pub const STRUCTURAL_V2: &str = "structural-v2";
-pub const STRUCTURAL_V3: &str = "structural-v3";
-
-/// A selectable scoring model. The default is the experimental v3 model;
-/// callers can select v1 or v2 explicitly when they need historical scores.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ScoringModel {
-    StructuralV1,
-    StructuralV2,
-    #[default]
-    StructuralV3,
-}
-
-impl ScoringModel {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::StructuralV1 => STRUCTURAL_V1,
-            Self::StructuralV2 => STRUCTURAL_V2,
-            Self::StructuralV3 => STRUCTURAL_V3,
-        }
-    }
-}
+/// Stable identifier for the scoring formula embedded in each report.
+pub const SCORE_MODEL: &str = "structural-v3";
 
 /// A machine-readable analysis report. JSON output serializes this structure
 /// directly, so adding fields should remain backwards-compatible.
@@ -68,9 +44,7 @@ pub struct CategorySummary {
     pub highest_score: usize,
 }
 
-/// Aggregate complexity in exact score units. For structural-v1 one unit is
-/// one score point; for structural-v2 and structural-v3 one unit is one tenth
-/// of a point.
+/// Aggregate complexity in exact integer-tenth score units.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Burden {
     pub production: usize,
@@ -168,7 +142,7 @@ pub struct Position {
 pub struct Metrics {
     pub code_lines: usize,
     pub statements: usize,
-    /// Count of expression-level operations used by structural-v3. Bindings,
+    /// Count of expression-level operations used by the structural score. Bindings,
     /// paths, literals, fields, borrows, grouping, and parentheses are not
     /// operations by themselves.
     pub expression_operations: usize,
@@ -197,23 +171,21 @@ pub struct Score {
     /// An unbounded integer score. Higher values indicate more structural
     /// signals in the function.
     pub value: usize,
-    /// Exact score units. This is equal to `value`; the explicit name makes
-    /// the tenths convention of structural-v2 and structural-v3 unambiguous in
-    /// JSON.
+    /// Exact integer-tenth score units. This is equal to `value` and is the
+    /// preferred field for machine-readable comparisons.
     pub units: usize,
-    /// Human-readable score, formatted according to the selected model.
+    /// Human-readable score, formatted in score points.
     pub display: String,
     pub decisions: usize,
-    /// The v2 and v3 control-decision count, excluding boolean operators.
+    /// Control-decision count, excluding boolean operators.
     pub control_decisions: usize,
     pub nesting_penalty: usize,
-    pub statement_penalty: usize,
     pub boundary: usize,
     pub boolean_operator_units: usize,
     pub call_site_units: usize,
     pub parameter_units: usize,
     pub match_arm_units: usize,
-    /// Structural-v3's one-tenth-unit charge for each expression operation.
+    /// One-tenth-unit charge for each expression operation.
     pub expression_operation_units: usize,
 }
 
