@@ -8,7 +8,36 @@ use kompass::{AnalysisOptions, OutputFormat, ScoringModel, SortBy, analyze, disc
 #[command(
     name = "kompass",
     version,
-    about = "Find the Rust code that takes the most thought to change"
+    about = "Find the Rust code that takes the most thought to change",
+    long_about = "Analyze Rust source and rank structural hotspots that may take more thought to understand and change.",
+    after_help = "Use `kompass --help` for the agent workflow and JSON field meanings.",
+    after_long_help = r#"
+Agent workflow:
+  1. Save a machine-readable baseline for one stable scope:
+       kompass --model structural-v3 --format json PATH > before.json
+  2. After a behavior-preserving refactor, rerun the same PATH and model:
+       kompass --model structural-v3 --format json PATH > after.json
+     Run the relevant behavior tests separately; a score comparison cannot
+     prove that behavior is preserved.
+  3. Compare integer fields in JSON. `summary.burden.production` is the
+     production burden in integer tenths (143 means 14.3). Inspect
+     `files[].burden`, `files[].functions[].score.value`, and
+     `files[].functions[].metrics` for file and function detail.
+
+JSON is the agent interface: it includes every analyzed function. `--top`,
+`--sort`, `--tests`, and `--all` affect text output only. Production and test
+categories use the same model but remain scored and summarized separately.
+Check `coverage.complete` and `errors`; status 0 means the report completed
+without analysis errors, while status 2 means the input, analysis, or output
+failed. Status 2 can still emit a partial JSON report, so a lower burden is
+inconclusive when coverage falls or macro opacity rises.
+
+`macro_opacity.invocations` and `macro_opacity.source_tokens` count macro
+source as written, without expansion, including built-in macros. Compare them
+with burden because a lower score is a review signal, not proof that code is
+cleaner or correct. Semantic module boundaries and coupling are not measured;
+review those manually and do not blindly minimize the score.
+"#
 )]
 struct Cli {
     /// Rust file, directory, or Cargo workspace to analyze.

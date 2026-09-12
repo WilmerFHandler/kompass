@@ -12,6 +12,60 @@ fn temporary_directory(label: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn help_explains_agent_workflow_and_json_contract() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+
+    for expected in [
+        "kompass --model structural-v3 --format json PATH > before.json",
+        "kompass --model structural-v3 --format json PATH > after.json",
+        "behavior-preserving refactor",
+        "score comparison cannot",
+        "summary.burden.production",
+        "integer tenths",
+        "files[].burden",
+        "files[].functions[].score.value",
+        "files[].functions[].metrics",
+        "macro_opacity.invocations",
+        "macro_opacity.source_tokens",
+        "without expansion, including built-in macros",
+        "Production and test",
+        "scored and summarized separately",
+        "--top",
+        "--sort",
+        "text output only",
+        "coverage.complete",
+        "errors",
+        "status 0",
+        "status 2",
+        "partial JSON report",
+        "lower score is a review signal",
+        "module boundaries and coupling",
+        "do not blindly minimize the score",
+    ] {
+        assert!(
+            help.contains(expected),
+            "help is missing {expected:?}\n{help}"
+        );
+    }
+}
+
+#[test]
+fn short_help_points_to_the_workflow() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .arg("-h")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("Use `kompass --help`"));
+}
+
+#[test]
 fn json_report_contains_separate_categories_and_tokens() {
     let root = temporary_directory("json");
     std::fs::create_dir_all(&root).unwrap();

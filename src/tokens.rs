@@ -34,31 +34,11 @@ impl LexedSource {
     }
 
     fn lower_bound_start(&self, position: TokenPosition) -> usize {
-        let mut low = 0;
-        let mut high = self.tokens.len();
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if self.tokens[middle].start < position {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        low
+        self.tokens.partition_point(|token| token.start < position)
     }
 
     fn upper_bound_end(&self, position: TokenPosition) -> usize {
-        let mut low = 0;
-        let mut high = self.tokens.len();
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if self.tokens[middle].end <= position {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        low
+        self.tokens.partition_point(|token| token.end <= position)
     }
 }
 
@@ -85,102 +65,168 @@ pub fn lex(source: &str) -> Result<LexedSource, String> {
 /// comment bytes preserves every span position while leaving ordinary comments
 /// to the lexer itself.
 fn mask_doc_comments(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut masked = bytes.to_vec();
-    let mut index = 0;
-    let mut raw_hashes = None;
-    let mut in_string = false;
-    let mut in_char = false;
-    let mut escaped = false;
-    let mut block_comment_depth = 0;
+    DocCommentMasker::new(source).run()
+}
 
-    while index < bytes.len() {
-        if let Some(hashes) = raw_hashes {
-            if bytes[index] == b'"' && has_hashes(bytes, index + 1, hashes) {
-                index += hashes + 1;
-                raw_hashes = None;
-                continue;
-            }
-            index += 1;
-            continue;
-        }
-        if in_string || in_char {
-            let current = bytes[index];
-            if escaped {
-                escaped = false;
-            } else if current == b'\\' {
-                escaped = true;
-            } else if (in_string && current == b'"') || (in_char && current == b'\'') {
-                in_string = false;
-                in_char = false;
-            }
-            index += 1;
-            continue;
-        }
+#[derive(Clone, Copy, Debug)]
+enum MaskState {
+    Code,
+    Quoted { quote: u8, escaped: bool },
+    RawString { hashes: usize },
+    BlockComment { depth: usize, mask: bool },
+}
 
-        if block_comment_depth > 0 {
-            if bytes[index..].starts_with(b"/*") {
-                block_comment_depth += 1;
-                index += 2;
-                continue;
-            }
-            if bytes[index..].starts_with(b"*/") {
-                block_comment_depth -= 1;
-                index += 2;
-            } else {
-                index += 1;
-            }
-            continue;
-        }
+struct DocCommentMasker<'a> {
+    source: &'a [u8],
+    masked: Vec<u8>,
+    index: usize,
+    state: MaskState,
+}
 
-        if let Some((opening_length, hashes)) = raw_string_delimiter(bytes, index) {
-            raw_hashes = Some(hashes);
-            index += opening_length;
-            continue;
+impl<'a> DocCommentMasker<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source: source.as_bytes(),
+            masked: source.as_bytes().to_vec(),
+            index: 0,
+            state: MaskState::Code,
         }
-        if bytes[index] == b'"' {
-            in_string = true;
-            index += 1;
-            continue;
-        }
-        if bytes[index] == b'\'' && looks_like_char_literal(bytes, index) {
-            in_char = true;
-            index += 1;
-            continue;
-        }
-
-        if bytes[index..].starts_with(b"/*") {
-            if bytes[index..].starts_with(b"/**") || bytes[index..].starts_with(b"/*!") {
-                mask_block_comment(&mut masked, bytes, &mut index);
-            } else {
-                block_comment_depth = 1;
-                index += 2;
-            }
-            continue;
-        }
-        if bytes[index..].starts_with(b"///") || bytes[index..].starts_with(b"//!") {
-            mask_until_newline(&mut masked, bytes, &mut index);
-            continue;
-        }
-        if bytes[index..].starts_with(b"//") {
-            while index < bytes.len() && bytes[index] != b'\n' {
-                index += 1;
-            }
-            continue;
-        }
-        index += 1;
     }
 
-    String::from_utf8(masked).expect("masking comments preserves UTF-8 bytes")
+    fn run(mut self) -> String {
+        while self.index < self.source.len() {
+            self.advance();
+        }
+        String::from_utf8(self.masked).expect("masking comments preserves UTF-8 bytes")
+    }
+
+    fn advance(&mut self) {
+        match self.state {
+            MaskState::Code => self.advance_code(),
+            MaskState::Quoted { quote, escaped } => self.advance_quoted(quote, escaped),
+            MaskState::RawString { hashes } => self.advance_raw_string(hashes),
+            MaskState::BlockComment { depth, mask } => self.advance_block_comment(depth, mask),
+        }
+    }
+
+    fn advance_code(&mut self) {
+        let bytes = self.source;
+        if let Some((opening_length, hashes)) = raw_string_delimiter(bytes, self.index) {
+            self.state = MaskState::RawString { hashes };
+            self.index += opening_length;
+        } else if bytes[self.index] == b'"' {
+            self.state = MaskState::Quoted {
+                quote: b'"',
+                escaped: false,
+            };
+            self.index += 1;
+        } else if bytes[self.index] == b'\'' && looks_like_char_literal(bytes, self.index) {
+            self.state = MaskState::Quoted {
+                quote: b'\'',
+                escaped: false,
+            };
+            self.index += 1;
+        } else if bytes[self.index..].starts_with(b"/**") || bytes[self.index..].starts_with(b"/*!")
+        {
+            self.state = MaskState::BlockComment {
+                depth: 1,
+                mask: true,
+            };
+            mask_comment_bytes(&mut self.masked, bytes, &mut self.index, 2);
+        } else if bytes[self.index..].starts_with(b"/*") {
+            self.state = MaskState::BlockComment {
+                depth: 1,
+                mask: false,
+            };
+            self.index += 2;
+        } else if bytes[self.index..].starts_with(b"///") || bytes[self.index..].starts_with(b"//!")
+        {
+            mask_until_newline(&mut self.masked, bytes, &mut self.index);
+        } else if bytes[self.index..].starts_with(b"//") {
+            self.skip_line_comment();
+        } else {
+            self.index += 1;
+        }
+    }
+
+    fn advance_quoted(&mut self, quote: u8, escaped: bool) {
+        let current = self.source[self.index];
+        self.index += 1;
+        self.state = if escaped {
+            MaskState::Quoted {
+                quote,
+                escaped: false,
+            }
+        } else if current == b'\\' {
+            MaskState::Quoted {
+                quote,
+                escaped: true,
+            }
+        } else if current == quote {
+            MaskState::Code
+        } else {
+            MaskState::Quoted {
+                quote,
+                escaped: false,
+            }
+        };
+    }
+
+    fn advance_raw_string(&mut self, hashes: usize) {
+        if self.source[self.index] == b'"' && has_hashes(self.source, self.index + 1, hashes) {
+            self.index += hashes + 1;
+            self.state = MaskState::Code;
+        } else {
+            self.index += 1;
+        }
+    }
+
+    fn advance_block_comment(&mut self, depth: usize, mask: bool) {
+        let bytes = self.source;
+        if bytes[self.index..].starts_with(b"/*") {
+            if mask {
+                mask_comment_bytes(&mut self.masked, bytes, &mut self.index, 2);
+            } else {
+                self.index += 2;
+            }
+            self.state = MaskState::BlockComment {
+                depth: depth + 1,
+                mask,
+            };
+        } else if bytes[self.index..].starts_with(b"*/") {
+            if mask {
+                mask_comment_bytes(&mut self.masked, bytes, &mut self.index, 2);
+            } else {
+                self.index += 2;
+            }
+            self.state = if depth == 1 {
+                MaskState::Code
+            } else {
+                MaskState::BlockComment {
+                    depth: depth - 1,
+                    mask,
+                }
+            };
+        } else {
+            if mask && bytes[self.index] != b'\n' && bytes[self.index] != b'\r' {
+                self.masked[self.index] = b' ';
+            }
+            self.index += 1;
+        }
+    }
+
+    fn skip_line_comment(&mut self) {
+        while self.index < self.source.len() && self.source[self.index] != b'\n' {
+            self.index += 1;
+        }
+    }
 }
 
 pub(crate) fn raw_string_delimiter(bytes: &[u8], index: usize) -> Option<(usize, usize)> {
-    let prefix = if bytes[index] == b'r' {
-        index
-    } else if bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'r') {
-        index + 1
-    } else {
-        return None;
+    let prefix = match bytes.get(index) {
+        Some(b'r') => index,
+        Some(b'b') if bytes.get(index + 1) == Some(&b'r') => index + 1,
+        _ => return None,
     };
     let mut cursor = prefix + 1;
     while bytes.get(cursor) == Some(&b'#') {
@@ -189,32 +235,90 @@ pub(crate) fn raw_string_delimiter(bytes: &[u8], index: usize) -> Option<(usize,
     (bytes.get(cursor) == Some(&b'"')).then_some((cursor - index + 1, cursor - prefix - 1))
 }
 
+/// Recognize the literal forms needed to distinguish a character from a
+/// lifetime or label. Plain characters inspect at most one UTF-8 scalar, and
+/// Unicode escapes inspect only the bytes through their closing brace.
 pub(crate) fn looks_like_char_literal(bytes: &[u8], index: usize) -> bool {
-    let Some(rest) = bytes
-        .get(index + 1..)
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+    if bytes.get(index) != Some(&b'\'') {
+        return false;
+    }
+
+    match bytes.get(index + 1) {
+        Some(b'\\') => escaped_char_literal(bytes, index + 2),
+        Some(b'\n' | b'\r') | None => false,
+        Some(&first_byte) => plain_char_literal(bytes, index + 1, first_byte),
+    }
+}
+
+fn escaped_char_literal(bytes: &[u8], escape: usize) -> bool {
+    match bytes.get(escape) {
+        Some(b'n' | b'r' | b't' | b'\\' | b'\'' | b'"' | b'0') => {
+            bytes.get(escape + 1) == Some(&b'\'')
+        }
+        Some(b'x') => {
+            bytes
+                .get(escape + 1)
+                .is_some_and(|byte| byte.is_ascii_hexdigit())
+                && bytes
+                    .get(escape + 2)
+                    .is_some_and(|byte| byte.is_ascii_hexdigit())
+                && bytes.get(escape + 3) == Some(&b'\'')
+        }
+        Some(b'u') => unicode_char_escape(bytes, escape + 1),
+        _ => false,
+    }
+}
+
+fn unicode_char_escape(bytes: &[u8], brace: usize) -> bool {
+    if bytes.get(brace) != Some(&b'{') {
+        return false;
+    }
+
+    let mut cursor = brace + 1;
+    let mut has_digit = false;
+    while let Some(&byte) = bytes.get(cursor) {
+        if byte == b'}' {
+            return has_digit && bytes.get(cursor + 1) == Some(&b'\'');
+        }
+        if byte == b'_' {
+            cursor += 1;
+            continue;
+        }
+        if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+        has_digit = true;
+        cursor += 1;
+    }
+    false
+}
+
+fn plain_char_literal(bytes: &[u8], start: usize, first_byte: u8) -> bool {
+    let Some(width) = utf8_char_width(first_byte) else {
+        return false;
+    };
+    let Some(end) = start.checked_add(width) else {
+        return false;
+    };
+    let Some(candidate) = bytes.get(start..end) else {
+        return false;
+    };
+    let Some(character) = std::str::from_utf8(candidate)
+        .ok()
+        .and_then(|text| text.chars().next())
     else {
         return false;
     };
-    let mut chars = rest.chars();
-    match chars.next() {
-        Some('\\') => match chars.next() {
-            Some('u') => {
-                for character in chars.by_ref() {
-                    if character == '}' {
-                        break;
-                    }
-                    if character == '\n' || character == '\r' {
-                        return false;
-                    }
-                }
-                chars.next() == Some('\'')
-            }
-            Some(character) if character != '\n' && character != '\r' => chars.next() == Some('\''),
-            _ => false,
-        },
-        Some(character) if character != '\n' && character != '\r' => chars.next() == Some('\''),
-        _ => false,
+    character != '\n' && character != '\r' && bytes.get(end) == Some(&b'\'')
+}
+
+fn utf8_char_width(first_byte: u8) -> Option<usize> {
+    match first_byte {
+        0x00..=0x7F => Some(1),
+        0xC2..=0xDF => Some(2),
+        0xE0..=0xEF => Some(3),
+        0xF0..=0xF4 => Some(4),
+        _ => None,
     }
 }
 
@@ -227,29 +331,6 @@ pub(crate) fn has_hashes(bytes: &[u8], start: usize, count: usize) -> bool {
 fn mask_until_newline(masked: &mut [u8], source: &[u8], index: &mut usize) {
     while *index < source.len() && source[*index] != b'\n' {
         if source[*index] != b'\r' {
-            masked[*index] = b' ';
-        }
-        *index += 1;
-    }
-}
-
-fn mask_block_comment(masked: &mut [u8], source: &[u8], index: &mut usize) {
-    let mut depth = 0;
-    while *index < source.len() {
-        if source[*index..].starts_with(b"/*") {
-            mask_comment_bytes(masked, source, index, 2);
-            depth += 1;
-            continue;
-        }
-        if source[*index..].starts_with(b"*/") {
-            mask_comment_bytes(masked, source, index, 2);
-            depth -= 1;
-            if depth == 0 {
-                break;
-            }
-            continue;
-        }
-        if source[*index] != b'\n' && source[*index] != b'\r' {
             masked[*index] = b' ';
         }
         *index += 1;
@@ -377,5 +458,64 @@ mod tests {
         .unwrap();
 
         assert!(source.total_tokens() > 20);
+    }
+
+    #[test]
+    fn char_literals_are_bounded_and_distinguish_lifetimes_and_labels() {
+        for source in [
+            "'λ'",
+            "'\\u{1_F980}'",
+            "'\\u{41_}'",
+            "'\\x41'",
+            "'\\''",
+            "'\\n'",
+        ] {
+            assert!(
+                looks_like_char_literal(source.as_bytes(), 0),
+                "expected {source:?} to be a char literal"
+            );
+        }
+
+        for source in [
+            "'a",
+            "'label:",
+            "'\\u{}'",
+            "'\\u{not-hex}'",
+            "'\\u{1-2}'",
+            "'\\x4'",
+            "'\\q'",
+        ] {
+            assert!(
+                !looks_like_char_literal(source.as_bytes(), 0),
+                "expected {source:?} not to be a char literal"
+            );
+        }
+
+        let mut malformed = vec![b'\'', b'\\', b'u', b'{'];
+        malformed.extend(std::iter::repeat_n(b'0', 1024));
+        assert!(!looks_like_char_literal(&malformed, 0));
+        assert!(!looks_like_char_literal(b"", 0));
+        assert!(!looks_like_char_literal(b"x'a'", 0));
+    }
+
+    #[test]
+    fn raw_strings_and_nested_doc_comments_keep_comment_markers_opaque() {
+        let source = r####"/// ignored documentation
+fn render() {
+    let raw = br###"/// this stays in the literal /* and here */"###;
+    /** outer doc /* nested doc */ still outer */
+    let value = 1;
+}
+"####;
+        let without_docs = r####"fn render() {
+    let raw = br###"/// this stays in the literal /* and here */"###;
+    let value = 1;
+}
+"####;
+
+        assert_eq!(
+            lex(source).unwrap().total_tokens(),
+            lex(without_docs).unwrap().total_tokens()
+        );
     }
 }

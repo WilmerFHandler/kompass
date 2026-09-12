@@ -58,6 +58,51 @@ kompass [PATH]                 Analyze the current directory by default
     --all                      Show both production and test rankings
 ```
 
+### Agent workflow
+
+For a machine-readable before/after comparison, keep the analyzed scope and
+model fixed. Save a baseline, make a behavior-preserving refactor, then run
+the same command again:
+
+```sh
+kompass --model structural-v3 --format json PATH > before.json
+# make the refactor while preserving behavior
+kompass --model structural-v3 --format json PATH > after.json
+```
+
+Run the relevant behavior tests separately because a score comparison cannot
+prove that behavior is preserved.
+
+For structural-v2 and structural-v3, `summary.burden.production` is the
+production burden in exact integer tenths, so `143` means `14.3`. The same
+report has separate `summary.burden.test` and `summary.burden.total` values;
+`files[].burden` shows file totals, and
+`files[].functions[].score.value` is the exact function score while
+`files[].functions[].metrics` explains its components. Production and test
+categories use the same score model and have separate scores and summaries.
+
+JSON includes every analyzed function, so `--top`, `--sort`, `--tests`, and
+`--all` affect text output only. Check `coverage` and `errors` before comparing
+reports, especially `coverage.complete`: status 0 means the report completed
+without analysis errors, while status 2 means the input, analysis, or output
+failed. A status-2 run can still emit a partial JSON report, so a lower burden
+is inconclusive when coverage falls or macro opacity rises. For example, `jq`
+can extract the comparable production burden and coverage without converting
+the units:
+
+```sh
+jq '{production_tenths: .summary.burden.production,
+     coverage: .coverage,
+     errors: .errors}' before.json
+```
+
+`macro_opacity.invocations` and `macro_opacity.source_tokens` count macro
+source as written without expansion, including built-in macros. Compare those
+signals with burden because a lower score is a review signal, not proof that
+the code is cleaner or correct. The source-only analysis does not resolve
+semantic module boundaries or coupling, so review those manually and do not
+blindly minimize the score.
+
 JSON always contains every analyzed function, regardless of `--top` and
 the text selection and sorting flags, so it is safe to use in scripts. `--sort`
 controls only the visible text rankings; JSON keeps its deterministic

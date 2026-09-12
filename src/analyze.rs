@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use syn::parse::Parser;
 use syn::spanned::Spanned;
@@ -132,14 +132,44 @@ pub fn analyze(input: &Path, discovered: Discovery, options: AnalysisOptions) ->
 /// Resolve test-only external modules while preserving production reachability.
 /// `syn` parses each file independently, so this pass builds the small module
 /// graph needed to carry `cfg(test)` context across conventional Rust files.
-fn discover_test_context_files(discovered: &[DiscoveredFile]) -> BTreeSet<std::path::PathBuf> {
-    let known_files = discovered
-        .iter()
-        .map(|file| file.path.clone())
-        .collect::<BTreeSet<_>>();
-    let mut edges = BTreeMap::<std::path::PathBuf, Vec<ModuleEdge>>::new();
-    let mut incoming = BTreeSet::new();
+fn discover_test_context_files(discovered: &[DiscoveredFile]) -> BTreeSet<PathBuf> {
+    let mut known_files = BTreeSet::new();
+    let mut cargo_test_roots = BTreeMap::new();
+    for file in discovered {
+        let path = file.path.clone();
+        known_files.insert(path.clone());
+        cargo_test_roots.entry(path).or_insert(file.is_test);
+    }
+
+    let (edges, incoming) = collect_module_edges(&known_files);
+    let mut reachability = BTreeMap::<PathBuf, Reachability>::new();
+    let mut pending = VecDeque::new();
     for path in &known_files {
+        let is_cargo_test_root = cargo_test_roots.get(path).copied().unwrap_or(false);
+        let state = Reachability {
+            production: !incoming.contains(path) && !is_cargo_test_root,
+            test: is_cargo_test_root,
+        };
+        if state.production || state.test {
+            pending.push_back(path.clone());
+        }
+        reachability.insert(path.clone(), state);
+    }
+
+    propagate_reachability(&edges, &mut reachability, &mut pending);
+
+    reachability
+        .into_iter()
+        .filter_map(|(path, state)| (state.test && !state.production).then_some(path))
+        .collect()
+}
+
+fn collect_module_edges(
+    known_files: &BTreeSet<PathBuf>,
+) -> (BTreeMap<PathBuf, Vec<ModuleEdge>>, BTreeSet<PathBuf>) {
+    let mut edges = BTreeMap::new();
+    let mut incoming = BTreeSet::new();
+    for path in known_files {
         let Ok(source) = fs::read_to_string(path) else {
             continue;
         };
@@ -148,7 +178,7 @@ fn discover_test_context_files(discovered: &[DiscoveredFile]) -> BTreeSet<std::p
         };
         let mut collector = ExternalTestModuleCollector {
             current_file: path,
-            known_files: &known_files,
+            known_files,
             test_context: false,
             files: Vec::new(),
         };
@@ -158,73 +188,53 @@ fn discover_test_context_files(discovered: &[DiscoveredFile]) -> BTreeSet<std::p
         }
         edges.insert(path.clone(), collector.files);
     }
+    (edges, incoming)
+}
 
-    let mut reachability = BTreeMap::<std::path::PathBuf, Reachability>::new();
-    let mut pending = VecDeque::new();
-    for path in &known_files {
-        let is_cargo_test_root = discovered
-            .iter()
-            .find(|file| file.path == *path)
-            .is_some_and(|file| file.is_test);
-        let state = reachability.entry(path.clone()).or_default();
-        if is_cargo_test_root {
-            state.test = true;
-        }
-        if !incoming.contains(path) && !is_cargo_test_root {
-            state.production = true;
-        }
-        if state.production || state.test {
-            pending.push_back(path.clone());
-        }
-    }
-
+fn propagate_reachability(
+    edges: &BTreeMap<PathBuf, Vec<ModuleEdge>>,
+    reachability: &mut BTreeMap<PathBuf, Reachability>,
+    pending: &mut VecDeque<PathBuf>,
+) {
     while let Some(path) = pending.pop_front() {
         let state = reachability[&path];
         for edge in edges.get(&path).into_iter().flatten() {
             let child = reachability.entry(edge.child.clone()).or_default();
-            let mut changed = false;
-            if edge.test_only {
-                if (state.production || state.test) && !child.test {
-                    child.test = true;
-                    changed = true;
-                }
-            } else {
-                if state.production && !child.production {
-                    child.production = true;
-                    changed = true;
-                }
-                if state.test && !child.test {
-                    child.test = true;
-                    changed = true;
-                }
-            }
-            if changed {
+            if child.merge_from(state, edge.test_only) {
                 pending.push_back(edge.child.clone());
             }
         }
     }
-
-    reachability
-        .into_iter()
-        .filter_map(|(path, state)| (state.test && !state.production).then_some(path))
-        .collect()
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct Reachability {
     production: bool,
     test: bool,
 }
 
+impl Reachability {
+    fn merge_from(&mut self, parent: Self, test_only: bool) -> bool {
+        let previous = *self;
+        if test_only {
+            self.test |= parent.production || parent.test;
+        } else {
+            self.production |= parent.production;
+            self.test |= parent.test;
+        }
+        *self != previous
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ModuleEdge {
-    child: std::path::PathBuf,
+    child: PathBuf,
     test_only: bool,
 }
 
 struct ExternalTestModuleCollector<'a> {
     current_file: &'a Path,
-    known_files: &'a BTreeSet<std::path::PathBuf>,
+    known_files: &'a BTreeSet<PathBuf>,
     test_context: bool,
     files: Vec<ModuleEdge>,
 }
@@ -253,8 +263,8 @@ impl<'ast> Visit<'ast> for ExternalTestModuleCollector<'_> {
 fn resolve_external_module_path(
     current_file: &Path,
     module: &ItemMod,
-    known_files: &BTreeSet<std::path::PathBuf>,
-) -> Option<std::path::PathBuf> {
+    known_files: &BTreeSet<PathBuf>,
+) -> Option<PathBuf> {
     let base = current_file.parent()?;
     let candidates = if let Some(relative) = module_path_attribute(&module.attrs) {
         vec![base.join(relative)]
@@ -276,7 +286,7 @@ fn resolve_external_module_path(
     })
 }
 
-fn module_path_attribute(attributes: &[Attribute]) -> Option<std::path::PathBuf> {
+fn module_path_attribute(attributes: &[Attribute]) -> Option<PathBuf> {
     attributes.iter().find_map(|attribute| {
         if !attribute.path().is_ident("path") {
             return None;
@@ -290,7 +300,7 @@ fn module_path_attribute(attributes: &[Attribute]) -> Option<std::path::PathBuf>
         let syn::Lit::Str(literal) = &expression.lit else {
             return None;
         };
-        Some(std::path::PathBuf::from(literal.value()))
+        Some(PathBuf::from(literal.value()))
     })
 }
 
@@ -882,153 +892,216 @@ impl LineAnalysis {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum LexicalState {
+    Normal,
+    LineComment,
+    BlockComment(usize),
+    Quoted { delimiter: u8, escaped: bool },
+    RawString { hashes: usize },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum LineKind {
+    #[default]
+    Blank,
+    Comment,
+    Code,
+}
+
+impl LineKind {
+    fn mark_comment(&mut self) {
+        *self = match *self {
+            Self::Code => Self::Code,
+            Self::Blank | Self::Comment => Self::Comment,
+        };
+    }
+}
+
 /// Classify each physical source line in one lexical pass. A line containing
 /// any code wins over a line comment, while comment-only and whitespace-only
 /// lines remain distinct. The prefix table makes each function's code-line
 /// lookup constant time after this file-level pass.
 fn classify_lines(source: &str) -> LineAnalysis {
-    let bytes = source.as_bytes();
-    let mut analysis = LineAnalysis {
-        code_prefix: vec![0],
-        ..LineAnalysis::default()
-    };
-    let mut index = 0;
-    let mut line_code = false;
-    let mut line_comment = false;
-    let mut in_line_comment = false;
-    let mut block_comment_depth = 0;
-    let mut raw_hashes = None;
-    let mut quote = None;
-    let mut escaped = false;
-
-    while index < bytes.len() {
-        if let Some(hashes) = raw_hashes {
-            line_code = true;
-            if bytes[index] == b'"' && tokens::has_hashes(bytes, index + 1, hashes) {
-                index += 1;
-                for _ in 0..hashes {
-                    if index < bytes.len() {
-                        line_code = true;
-                        index += 1;
-                    }
-                }
-                raw_hashes = None;
-                continue;
-            }
-            if bytes[index] == b'\n' {
-                finish_line(&mut analysis, &mut line_code, &mut line_comment);
-            }
-            index += 1;
-            continue;
-        }
-
-        if let Some(quote_character) = quote {
-            line_code = true;
-            if escaped {
-                escaped = false;
-            } else if bytes[index] == b'\\' {
-                escaped = true;
-            } else if bytes[index] == quote_character {
-                quote = None;
-            }
-            if bytes[index] == b'\n' {
-                finish_line(&mut analysis, &mut line_code, &mut line_comment);
-            }
-            index += 1;
-            continue;
-        }
-
-        if in_line_comment {
-            if bytes[index] == b'\n' {
-                in_line_comment = false;
-                finish_line(&mut analysis, &mut line_code, &mut line_comment);
-            }
-            index += 1;
-            continue;
-        }
-
-        if block_comment_depth > 0 {
-            line_comment = true;
-            if bytes[index..].starts_with(b"/*") {
-                block_comment_depth += 1;
-                index += 2;
-                continue;
-            }
-            if bytes[index..].starts_with(b"*/") {
-                block_comment_depth -= 1;
-                index += 2;
-                continue;
-            }
-            if bytes[index] == b'\n' {
-                finish_line(&mut analysis, &mut line_code, &mut line_comment);
-            }
-            index += 1;
-            continue;
-        }
-
-        if bytes[index] == b'\n' {
-            finish_line(&mut analysis, &mut line_code, &mut line_comment);
-            index += 1;
-            continue;
-        }
-
-        if let Some((opening_length, hashes)) = tokens::raw_string_delimiter(bytes, index) {
-            line_code = true;
-            index += opening_length;
-            raw_hashes = Some(hashes);
-            continue;
-        }
-        if bytes[index] == b'"' {
-            line_code = true;
-            quote = Some(b'"');
-            index += 1;
-            continue;
-        }
-        if bytes[index] == b'\'' && tokens::looks_like_char_literal(bytes, index) {
-            line_code = true;
-            quote = Some(b'\'');
-            index += 1;
-            continue;
-        }
-        if bytes[index..].starts_with(b"/*") {
-            line_comment = true;
-            block_comment_depth = 1;
-            index += 2;
-            continue;
-        }
-        if bytes[index..].starts_with(b"//") {
-            line_comment = true;
-            in_line_comment = true;
-            index += 2;
-            continue;
-        }
-        if !bytes[index].is_ascii_whitespace() {
-            line_code = true;
-        }
-        index += 1;
-    }
-
-    if !source.is_empty() && !source.ends_with('\n') {
-        finish_line(&mut analysis, &mut line_code, &mut line_comment);
-    }
-    analysis
+    LineClassifier::new(source).run()
 }
 
-fn finish_line(analysis: &mut LineAnalysis, line_code: &mut bool, line_comment: &mut bool) {
-    analysis.counts.total += 1;
-    if *line_code {
-        analysis.counts.code += 1;
-    } else if *line_comment {
-        analysis.counts.comments += 1;
-    } else {
-        analysis.counts.blank += 1;
+struct LineClassifier<'a> {
+    bytes: &'a [u8],
+    index: usize,
+    analysis: LineAnalysis,
+    line_kind: LineKind,
+    state: LexicalState,
+}
+
+impl<'a> LineClassifier<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            bytes: source.as_bytes(),
+            index: 0,
+            analysis: LineAnalysis {
+                code_prefix: vec![0],
+                ..LineAnalysis::default()
+            },
+            line_kind: LineKind::default(),
+            state: LexicalState::Normal,
+        }
     }
-    let previous = *analysis.code_prefix.last().unwrap_or(&0);
-    analysis
-        .code_prefix
-        .push(previous + usize::from(*line_code));
-    *line_code = false;
-    *line_comment = false;
+
+    fn run(mut self) -> LineAnalysis {
+        while self.index < self.bytes.len() {
+            self.advance();
+        }
+        if !self.bytes.is_empty() && !self.bytes.ends_with(b"\n") {
+            self.finish_line();
+        }
+        self.analysis
+    }
+
+    fn advance(&mut self) {
+        match self.state {
+            LexicalState::Normal => self.advance_normal(),
+            LexicalState::LineComment => self.advance_line_comment(),
+            LexicalState::BlockComment(depth) => self.advance_block_comment(depth),
+            LexicalState::Quoted { delimiter, escaped } => self.advance_quoted(delimiter, escaped),
+            LexicalState::RawString { hashes } => self.advance_raw_string(hashes),
+        }
+    }
+
+    fn advance_normal(&mut self) {
+        if self.bytes[self.index] == b'\n' {
+            self.finish_line();
+            self.index += 1;
+            return;
+        }
+        if let Some((opening_length, hashes)) = tokens::raw_string_delimiter(self.bytes, self.index)
+        {
+            self.line_kind = LineKind::Code;
+            self.state = LexicalState::RawString { hashes };
+            self.index += opening_length;
+            return;
+        }
+        if self.bytes[self.index] == b'"' {
+            self.line_kind = LineKind::Code;
+            self.state = LexicalState::Quoted {
+                delimiter: b'"',
+                escaped: false,
+            };
+            self.index += 1;
+            return;
+        }
+        if self.bytes[self.index] == b'\''
+            && tokens::looks_like_char_literal(self.bytes, self.index)
+        {
+            self.line_kind = LineKind::Code;
+            self.state = LexicalState::Quoted {
+                delimiter: b'\'',
+                escaped: false,
+            };
+            self.index += 1;
+            return;
+        }
+        if self.bytes[self.index..].starts_with(b"/*") {
+            self.line_kind.mark_comment();
+            self.state = LexicalState::BlockComment(1);
+            self.index += 2;
+            return;
+        }
+        if self.bytes[self.index..].starts_with(b"//") {
+            self.line_kind.mark_comment();
+            self.state = LexicalState::LineComment;
+            self.index += 2;
+            return;
+        }
+        if !self.bytes[self.index].is_ascii_whitespace() {
+            self.line_kind = LineKind::Code;
+        }
+        self.index += 1;
+    }
+
+    fn advance_line_comment(&mut self) {
+        if self.bytes[self.index] == b'\n' {
+            self.state = LexicalState::Normal;
+            self.finish_line();
+        }
+        self.index += 1;
+    }
+
+    fn advance_block_comment(&mut self, depth: usize) {
+        self.line_kind.mark_comment();
+        if self.bytes[self.index..].starts_with(b"/*") {
+            self.state = LexicalState::BlockComment(depth + 1);
+            self.index += 2;
+        } else if self.bytes[self.index..].starts_with(b"*/") {
+            self.state = if depth == 1 {
+                LexicalState::Normal
+            } else {
+                LexicalState::BlockComment(depth - 1)
+            };
+            self.index += 2;
+        } else {
+            if self.bytes[self.index] == b'\n' {
+                self.finish_line();
+            }
+            self.index += 1;
+        }
+    }
+
+    fn advance_quoted(&mut self, delimiter: u8, escaped: bool) {
+        self.line_kind = LineKind::Code;
+        if escaped {
+            self.state = LexicalState::Quoted {
+                delimiter,
+                escaped: false,
+            };
+        } else if self.bytes[self.index] == b'\\' {
+            self.state = LexicalState::Quoted {
+                delimiter,
+                escaped: true,
+            };
+        } else if self.bytes[self.index] == delimiter {
+            self.state = LexicalState::Normal;
+        }
+        if self.bytes[self.index] == b'\n' {
+            self.finish_line();
+        }
+        self.index += 1;
+    }
+
+    fn advance_raw_string(&mut self, hashes: usize) {
+        self.line_kind = LineKind::Code;
+        if self.bytes[self.index] == b'"' && tokens::has_hashes(self.bytes, self.index + 1, hashes)
+        {
+            self.index += hashes + 1;
+            self.state = LexicalState::Normal;
+        } else {
+            if self.bytes[self.index] == b'\n' {
+                self.finish_line();
+            }
+            self.index += 1;
+        }
+    }
+
+    fn finish_line(&mut self) {
+        self.analysis.counts.total += 1;
+        let code = match self.line_kind {
+            LineKind::Code => {
+                self.analysis.counts.code += 1;
+                true
+            }
+            LineKind::Comment => {
+                self.analysis.counts.comments += 1;
+                false
+            }
+            LineKind::Blank => {
+                self.analysis.counts.blank += 1;
+                false
+            }
+        };
+        let previous = *self.analysis.code_prefix.last().unwrap_or(&0);
+        self.analysis.code_prefix.push(previous + usize::from(code));
+        self.line_kind = LineKind::Blank;
+    }
 }
 
 #[cfg(test)]
@@ -1362,6 +1435,80 @@ mod tests {
     }
 
     #[test]
+    fn shared_external_module_cycles_preserve_production_dominance() {
+        let root = std::env::temp_dir().join(format!(
+            "kompass-cyclic-modules-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let lib_path = root.join("lib.rs");
+        let production_path = root.join("production.rs");
+        let test_root_path = root.join("test_root.rs");
+        let cycle_path = root.join("cycle.rs");
+        std::fs::write(
+            &lib_path,
+            "mod production;\n#[cfg(test)] mod test_root;\nfn entry() {}\n",
+        )
+        .unwrap();
+        std::fs::write(&production_path, "mod cycle;\nfn production_helper() {}\n").unwrap();
+        std::fs::write(&test_root_path, "mod cycle;\nfn test_helper() {}\n").unwrap();
+        std::fs::write(
+            &cycle_path,
+            "#[path = \"production.rs\"] mod production_again;\nfn cycle_helper() {}\n",
+        )
+        .unwrap();
+
+        let report = analyze(
+            &root,
+            Discovery {
+                files: vec![
+                    DiscoveredFile {
+                        path: lib_path,
+                        is_test: false,
+                    },
+                    DiscoveredFile {
+                        path: production_path,
+                        is_test: false,
+                    },
+                    DiscoveredFile {
+                        path: test_root_path,
+                        is_test: false,
+                    },
+                    DiscoveredFile {
+                        path: cycle_path,
+                        is_test: false,
+                    },
+                ],
+                test_files: 0,
+            },
+            AnalysisOptions::default(),
+        );
+
+        assert_eq!(report.summary.production.functions, 3);
+        assert_eq!(report.summary.test.functions, 1);
+        assert_eq!(report.coverage.test_files, 1);
+        assert_eq!(
+            report
+                .files
+                .iter()
+                .map(|file| (file.path.clone(), file.functions[0].category))
+                .collect::<Vec<_>>(),
+            vec![
+                ("cycle.rs".to_owned(), Category::Production),
+                ("lib.rs".to_owned(), Category::Production),
+                ("production.rs".to_owned(), Category::Production),
+                ("test_root.rs".to_owned(), Category::Test),
+            ]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn function_tokens_cover_signature_through_body_but_exclude_outer_attrs() {
         let source = r#"
             #[inline]
@@ -1429,6 +1576,29 @@ mod tests {
         assert_eq!(counts.code, 4);
         assert_eq!(counts.comments, 3);
         assert_eq!(counts.blank, 0);
+    }
+
+    #[test]
+    fn line_counts_keep_literal_and_comment_blank_lines_as_content() {
+        let source = concat!(
+            "let raw = r#\"first\n",
+            "\n",
+            "third\"#;\n",
+            "/* comment\n",
+            "\n",
+            "end */\n",
+        );
+        let analysis = classify_lines(source);
+        let counts = analysis.counts.clone();
+
+        assert_eq!(counts.total, 6);
+        assert_eq!(counts.code, 3);
+        assert_eq!(counts.comments, 3);
+        assert_eq!(counts.blank, 0);
+        assert_eq!(analysis.code_lines_in_range(1, 6), 3);
+        assert_eq!(analysis.code_lines_in_range(2, 2), 1);
+        assert_eq!(analysis.code_lines_in_range(5, 5), 0);
+        assert_eq!(analysis.code_lines_in_range(8, 9), 0);
     }
 
     #[test]
