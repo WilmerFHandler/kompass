@@ -20,7 +20,7 @@ use ruff_text_size::{Ranged, TextRange, TextSize};
 use crate::identity;
 use crate::model::{
     Category, FileAnalysis, FunctionKind, FunctionReport, Language, LineCounts, Location,
-    MacroOpacity, Metrics, Position,
+    MacroOpacity, Metrics, Position, ScoreComponent, ScoreContribution,
 };
 use crate::score;
 
@@ -50,10 +50,10 @@ pub fn analyze_file(
         .as_module()
         .ok_or_else(|| "Python frontend produced a non-module syntax tree".to_owned())?;
     let line_map = LineMap::new(source, parsed.tokens());
-    let tokens = count_tokens(parsed.tokens());
+    let token_index = TokenIndex::new(parsed.tokens());
     let mut collector = UnitCollector {
         source,
-        tokens: parsed.tokens(),
+        token_index: &token_index,
         line_map: &line_map,
         category,
         scope: Vec::new(),
@@ -63,7 +63,7 @@ pub fn analyze_file(
 
     Ok(FileAnalysis {
         lines: line_map.counts.clone(),
-        tokens,
+        tokens: token_index.total(),
         functions: collector.functions,
         macro_opacity: MacroOpacity::default(),
     })
@@ -93,13 +93,6 @@ fn format_parse_errors(parsed: &ruff_python_parser::Parsed<Mod>) -> String {
     }
 }
 
-fn count_tokens(tokens: &Tokens) -> usize {
-    tokens
-        .iter()
-        .filter(|token| is_counted_token(token.kind()))
-        .count()
-}
-
 fn is_counted_token(kind: TokenKind) -> bool {
     !matches!(
         kind,
@@ -112,16 +105,60 @@ fn is_counted_token(kind: TokenKind) -> bool {
     )
 }
 
-fn count_tokens_in(tokens: &Tokens, range: TextRange) -> usize {
-    tokens
-        .iter()
-        .filter(|token| {
-            let token_range = token.range();
-            token_range.start() >= range.start()
-                && token_range.end() <= range.end()
-                && is_counted_token(token.kind())
-        })
-        .count()
+#[derive(Clone, Debug, Default)]
+struct TokenIndex {
+    starts: Vec<usize>,
+    ends: Vec<usize>,
+    prefix: Vec<usize>,
+}
+
+impl TokenIndex {
+    fn new(tokens: &Tokens) -> Self {
+        let mut ranges = tokens
+            .iter()
+            .filter(|token| is_counted_token(token.kind()))
+            .map(|token| {
+                let range = token.range();
+                (range.start().to_usize(), range.end().to_usize())
+            })
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+
+        let mut starts = Vec::with_capacity(ranges.len());
+        let mut ends = Vec::with_capacity(ranges.len());
+        let mut prefix = Vec::with_capacity(ranges.len() + 1);
+        prefix.push(0);
+        for (start, end) in ranges {
+            starts.push(start);
+            ends.push(end);
+            let previous = *prefix.last().unwrap_or(&0);
+            prefix.push(previous + 1);
+        }
+        Self {
+            starts,
+            ends,
+            prefix,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.prefix.last().copied().unwrap_or(0)
+    }
+
+    /// Count tokens fully contained in a range using two binary searches and
+    /// the prefix count. The construction is linear in the file token count;
+    /// each callable query is logarithmic instead of scanning the file.
+    fn count_in(&self, range: TextRange) -> usize {
+        let start = range.start().to_usize();
+        let end = range.end().to_usize();
+        let first = self.starts.partition_point(|candidate| *candidate < start);
+        let last = self.ends.partition_point(|candidate| *candidate <= end);
+        self.prefix
+            .get(last)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(self.prefix.get(first).copied().unwrap_or(0))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -257,7 +294,7 @@ enum ScopeKind {
 
 struct UnitCollector<'a> {
     source: &'a str,
-    tokens: &'a Tokens,
+    token_index: &'a TokenIndex,
     line_map: &'a LineMap,
     category: Category,
     scope: Vec<String>,
@@ -267,7 +304,13 @@ struct UnitCollector<'a> {
 impl<'a> UnitCollector<'a> {
     fn collect_module(&mut self, module: &ModModule) {
         let range = TextRange::new(TextSize::new(0), text_size(self.source.len()));
-        let metrics = measure_body(&module.body, self.line_map.code_lines_in(range), 0, 0, 0);
+        let (metrics, contributions) = measure_body_with_contributions(
+            &module.body,
+            self.line_map.code_lines_in(range),
+            0,
+            0,
+            0,
+        );
         if initializer_has_work(&module.body, &metrics) {
             self.functions.push(self.make_report(
                 self.qualified_name("<module>"),
@@ -276,6 +319,7 @@ impl<'a> UnitCollector<'a> {
                 range,
                 body_range(&module.body).unwrap_or(range),
                 metrics,
+                contributions,
             ));
         }
         self.collect_body(&module.body, 0, ScopeKind::Module);
@@ -300,13 +344,14 @@ impl<'a> UnitCollector<'a> {
         let explicit_parameters =
             explicit_parameter_count(&node.parameters, kind == FunctionKind::Method, node);
         let range = node.range;
-        let metrics = measure_body(
+        let (metrics, contributions) = measure_body_with_contributions(
             &node.body,
             self.line_map.code_lines_in(range),
             node.parameters.len(),
             explicit_parameters,
             depth,
         );
+        let is_method = kind == FunctionKind::Method;
         self.scope.push(name.clone());
         let qualified_name = self.qualified_name("");
         self.scope.pop();
@@ -318,6 +363,7 @@ impl<'a> UnitCollector<'a> {
             declaration_range(range, body),
             body,
             metrics,
+            with_parameter_contributions(contributions, &node.parameters, is_method, node),
         ));
 
         self.collect_function_header(node, depth);
@@ -329,7 +375,13 @@ impl<'a> UnitCollector<'a> {
     fn add_class(&mut self, node: &StmtClassDef, depth: usize) {
         let name = node.name.to_string();
         let range = node.range;
-        let metrics = measure_body(&node.body, self.line_map.code_lines_in(range), 0, 0, depth);
+        let (metrics, contributions) = measure_body_with_contributions(
+            &node.body,
+            self.line_map.code_lines_in(range),
+            0,
+            0,
+            depth,
+        );
         self.scope.push(name.clone());
         if initializer_has_work(&node.body, &metrics) {
             let qualified_name = self.qualified_name("<class>");
@@ -340,6 +392,7 @@ impl<'a> UnitCollector<'a> {
                 range,
                 body_range(&node.body).unwrap_or(range),
                 metrics,
+                contributions,
             ));
         }
         self.collect_class_header(node, depth);
@@ -351,7 +404,7 @@ impl<'a> UnitCollector<'a> {
         let range = node.range;
         let parameters = node.parameters.as_deref();
         let parameter_count = parameters.map_or(0, Parameters::len);
-        let metrics = measure_expression(
+        let (metrics, contributions) = measure_expression_with_contributions(
             &node.body,
             self.line_map.code_lines_in(range),
             parameter_count,
@@ -374,6 +427,7 @@ impl<'a> UnitCollector<'a> {
             declaration_range(range, body),
             body,
             metrics,
+            with_lambda_parameter_contributions(contributions, parameters),
         ));
 
         if let Some(parameters) = &node.parameters {
@@ -451,10 +505,31 @@ impl<'a> UnitCollector<'a> {
         declaration: TextRange,
         body: TextRange,
         metrics: Metrics,
+        mut contributions: Vec<PendingContribution>,
     ) -> FunctionReport {
         let start = self.line_map.position(range.start());
         let end = self.line_map.end_position(range.end());
         let lines = end.line.saturating_sub(start.line) + 1;
+        contributions.push(PendingContribution {
+            component: ScoreComponent::Boundary,
+            units: 10,
+            range,
+        });
+        let contributions = contributions
+            .into_iter()
+            .map(|contribution| ScoreContribution {
+                component: contribution.component,
+                units: contribution.units,
+                location: Location {
+                    start: self.line_map.position(contribution.range.start()),
+                    end: self.line_map.end_position(contribution.range.end()),
+                },
+            })
+            .collect::<Vec<_>>();
+        let location = Location {
+            start: start.clone(),
+            end: end.clone(),
+        };
         FunctionReport {
             snapshot_id: String::new(),
             declaration_fingerprint: identity::range_fingerprint(
@@ -472,10 +547,13 @@ impl<'a> UnitCollector<'a> {
             name,
             kind,
             category: self.category,
-            location: Location { start, end },
+            location: Location {
+                start: start.clone(),
+                end: end.clone(),
+            },
             lines,
-            tokens: count_tokens_in(self.tokens, range),
-            score: score::score(&metrics),
+            tokens: self.token_index.count_in(range),
+            score: score::score_with_contributions(&metrics, location, contributions),
             metrics,
         }
     }
@@ -651,6 +729,42 @@ fn explicit_parameter_count(
     count
 }
 
+fn with_parameter_contributions(
+    mut contributions: Vec<PendingContribution>,
+    parameters: &Parameters,
+    is_method: bool,
+    function: &StmtFunctionDef,
+) -> Vec<PendingContribution> {
+    let skip_receiver = is_method && !is_staticmethod(function);
+    for (index, parameter) in parameters.iter().enumerate() {
+        if skip_receiver && index == 0 && matches!(parameter.name().as_ref(), "self" | "cls") {
+            continue;
+        }
+        contributions.push(PendingContribution {
+            component: ScoreComponent::ExplicitParameters,
+            units: 2,
+            range: parameter.range(),
+        });
+    }
+    contributions
+}
+
+fn with_lambda_parameter_contributions(
+    mut contributions: Vec<PendingContribution>,
+    parameters: Option<&Parameters>,
+) -> Vec<PendingContribution> {
+    if let Some(parameters) = parameters {
+        for parameter in parameters {
+            contributions.push(PendingContribution {
+                component: ScoreComponent::ExplicitParameters,
+                units: 2,
+                range: parameter.range(),
+            });
+        }
+    }
+    contributions
+}
+
 fn is_staticmethod(function: &StmtFunctionDef) -> bool {
     function
         .decorator_list
@@ -666,13 +780,20 @@ fn text_size(value: usize) -> TextSize {
     TextSize::new(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
-fn measure_body(
+#[derive(Clone, Copy, Debug)]
+struct PendingContribution {
+    component: ScoreComponent,
+    units: usize,
+    range: TextRange,
+}
+
+fn measure_body_with_contributions(
     body: &[Stmt],
     code_lines: usize,
     parameters: usize,
     explicit_parameters: usize,
     base_depth: usize,
-) -> Metrics {
+) -> (Metrics, Vec<PendingContribution>) {
     let mut visitor = MetricsCollector {
         metrics: Metrics {
             code_lines,
@@ -681,18 +802,19 @@ fn measure_body(
             ..Metrics::default()
         },
         depth: base_depth,
+        contributions: Vec::new(),
     };
     visitor.visit_body(body);
-    visitor.metrics
+    (visitor.metrics, visitor.contributions)
 }
 
-fn measure_expression(
+fn measure_expression_with_contributions(
     expression: &Expr,
     code_lines: usize,
     parameters: usize,
     explicit_parameters: usize,
     base_depth: usize,
-) -> Metrics {
+) -> (Metrics, Vec<PendingContribution>) {
     let mut visitor = MetricsCollector {
         metrics: Metrics {
             code_lines,
@@ -701,24 +823,42 @@ fn measure_expression(
             ..Metrics::default()
         },
         depth: base_depth,
+        contributions: Vec::new(),
     };
     visitor.visit_expr(expression);
     visitor.metrics.statements = 1;
-    visitor.metrics
+    (visitor.metrics, visitor.contributions)
 }
 
 struct MetricsCollector {
     metrics: Metrics,
     depth: usize,
+    contributions: Vec<PendingContribution>,
 }
 
 impl MetricsCollector {
-    fn branch(&mut self) {
+    fn push(&mut self, component: ScoreComponent, units: usize, range: TextRange) {
+        self.contributions.push(PendingContribution {
+            component,
+            units,
+            range,
+        });
+    }
+
+    fn branch(&mut self, range: TextRange) {
         self.metrics.branches += 1;
         self.metrics.decisions += 1;
         self.metrics.control_decisions += 1;
         self.metrics.nesting_penalty += self.depth;
         self.metrics.max_depth = self.metrics.max_depth.max(self.depth + 1);
+        self.push(ScoreComponent::ControlDecisions, 10, range);
+        if self.depth > 0 {
+            self.push(
+                ScoreComponent::NestingPenalty,
+                self.depth.saturating_mul(10),
+                range,
+            );
+        }
     }
 
     fn with_depth(&mut self, visit: impl FnOnce(&mut Self)) {
@@ -758,13 +898,13 @@ impl MetricsCollector {
         element: impl FnOnce(&mut Self),
     ) {
         for generator in generators {
-            self.branch();
+            self.branch(generator.range);
             self.metrics.loops += 1;
             self.visit_expr(&generator.iter);
             self.visit_expr(&generator.target);
             self.depth += 1;
             for condition in &generator.ifs {
-                self.branch();
+                self.branch(condition.range());
                 self.visit_expr(condition);
             }
         }
@@ -780,12 +920,12 @@ impl<'ast> Visitor<'ast> for MetricsCollector {
             Stmt::FunctionDef(node) => self.visit_function_header(node),
             Stmt::ClassDef(node) => self.visit_class_header(node),
             Stmt::If(node) => {
-                self.branch();
+                self.branch(node.range);
                 self.visit_expr(&node.test);
                 self.with_depth(|visitor| visitor.visit_body(&node.body));
                 for clause in &node.elif_else_clauses {
                     if let Some(test) = &clause.test {
-                        self.branch();
+                        self.branch(clause.range);
                         self.visit_expr(test);
                         self.with_depth(|visitor| visitor.visit_body(&clause.body));
                     } else {
@@ -794,7 +934,7 @@ impl<'ast> Visitor<'ast> for MetricsCollector {
                 }
             }
             Stmt::For(node) => {
-                self.branch();
+                self.branch(node.range);
                 self.metrics.loops += 1;
                 self.visit_expr(&node.iter);
                 self.visit_expr(&node.target);
@@ -802,7 +942,7 @@ impl<'ast> Visitor<'ast> for MetricsCollector {
                 self.with_depth(|visitor| visitor.visit_body(&node.orelse));
             }
             Stmt::While(node) => {
-                self.branch();
+                self.branch(node.range);
                 self.metrics.loops += 1;
                 self.visit_expr(&node.test);
                 self.with_depth(|visitor| visitor.visit_body(&node.body));
@@ -811,19 +951,25 @@ impl<'ast> Visitor<'ast> for MetricsCollector {
             Stmt::With(node) => {
                 self.metrics.expression_operations += node.items.len();
                 for item in &node.items {
+                    self.push(ScoreComponent::ExpressionOperations, 1, item.range);
+                }
+                for item in &node.items {
                     self.visit_with_item(item);
                 }
                 self.visit_body(&node.body);
             }
             Stmt::Match(node) => {
-                self.branch();
+                self.branch(node.range);
                 self.metrics.match_arms += node.cases.len();
+                for case in &node.cases {
+                    self.push(ScoreComponent::MatchArms, 2, case.range);
+                }
                 self.visit_expr(&node.subject);
                 for case in &node.cases {
                     self.with_depth(|visitor| {
                         visitor.visit_pattern(&case.pattern);
                         if let Some(guard) = &case.guard {
-                            visitor.branch();
+                            visitor.branch(guard.range());
                             visitor.visit_expr(guard);
                         }
                         visitor.visit_body(&case.body);
@@ -833,7 +979,7 @@ impl<'ast> Visitor<'ast> for MetricsCollector {
             Stmt::Try(node) => {
                 self.with_depth(|visitor| visitor.visit_body(&node.body));
                 for handler in &node.handlers {
-                    self.branch();
+                    self.branch(handler.range());
                     match handler {
                         ruff_python_ast::ExceptHandler::ExceptHandler(handler) => {
                             if let Some(type_) = &handler.type_ {
@@ -849,6 +995,7 @@ impl<'ast> Visitor<'ast> for MetricsCollector {
             Stmt::Assign(node) => {
                 self.metrics.mutations += 1;
                 self.metrics.expression_operations += 1;
+                self.push(ScoreComponent::ExpressionOperations, 1, node.range);
                 self.visit_expr(&node.value);
                 for target in &node.targets {
                     self.visit_expr(target);
@@ -857,12 +1004,14 @@ impl<'ast> Visitor<'ast> for MetricsCollector {
             Stmt::AugAssign(node) => {
                 self.metrics.mutations += 1;
                 self.metrics.expression_operations += 1;
+                self.push(ScoreComponent::ExpressionOperations, 1, node.range);
                 self.visit_expr(&node.value);
                 self.visit_expr(&node.target);
             }
             Stmt::AnnAssign(node) => {
                 self.metrics.mutations += 1;
                 self.metrics.expression_operations += 1;
+                self.push(ScoreComponent::ExpressionOperations, 1, node.range);
                 self.visit_expr(&node.annotation);
                 self.visit_expr(&node.target);
                 if let Some(value) = &node.value {
@@ -872,6 +1021,7 @@ impl<'ast> Visitor<'ast> for MetricsCollector {
             Stmt::TypeAlias(node) => {
                 self.metrics.mutations += 1;
                 self.metrics.expression_operations += 1;
+                self.push(ScoreComponent::ExpressionOperations, 1, node.range);
                 self.visit_expr(&node.name);
                 if let Some(type_params) = &node.type_params {
                     self.visit_type_params(type_params);
@@ -900,17 +1050,22 @@ impl<'ast> Visitor<'ast> for MetricsCollector {
                 let links = values.len().saturating_sub(1);
                 self.metrics.boolean_operators += links;
                 self.metrics.decisions += links;
+                for _ in 0..links {
+                    self.push(ScoreComponent::BooleanOperators, 5, expr.range());
+                }
                 for value in values {
                     self.visit_expr(value);
                 }
             }
             Expr::BinOp(node) => {
                 self.metrics.expression_operations += 1;
+                self.push(ScoreComponent::ExpressionOperations, 1, node.range);
                 self.visit_expr(&node.left);
                 self.visit_expr(&node.right);
             }
             Expr::UnaryOp(node) => {
                 self.metrics.expression_operations += 1;
+                self.push(ScoreComponent::ExpressionOperations, 1, node.range);
                 self.visit_expr(&node.operand);
             }
             Expr::Compare(ExprCompare {
@@ -920,6 +1075,9 @@ impl<'ast> Visitor<'ast> for MetricsCollector {
                 ..
             }) => {
                 self.metrics.expression_operations += ops.len();
+                for _ in ops.iter() {
+                    self.push(ScoreComponent::ExpressionOperations, 1, expr.range());
+                }
                 self.visit_expr(left);
                 for comparator in comparators {
                     self.visit_expr(comparator);
@@ -929,36 +1087,42 @@ impl<'ast> Visitor<'ast> for MetricsCollector {
                 func, arguments, ..
             }) => {
                 self.metrics.call_sites += 1;
+                self.push(ScoreComponent::CallSites, 2, expr.range());
                 self.visit_expr(func);
                 self.visit_arguments(arguments);
             }
             Expr::Subscript(node) => {
                 self.metrics.expression_operations += 1;
+                self.push(ScoreComponent::ExpressionOperations, 1, node.range);
                 self.visit_expr(&node.value);
                 self.visit_expr(&node.slice);
             }
             Expr::Await(node) => {
                 self.metrics.expression_operations += 1;
+                self.push(ScoreComponent::ExpressionOperations, 1, node.range);
                 self.visit_expr(&node.value);
             }
             Expr::Yield(node) => {
                 self.metrics.expression_operations += 1;
+                self.push(ScoreComponent::ExpressionOperations, 1, node.range);
                 if let Some(value) = &node.value {
                     self.visit_expr(value);
                 }
             }
             Expr::YieldFrom(node) => {
                 self.metrics.expression_operations += 1;
+                self.push(ScoreComponent::ExpressionOperations, 1, node.range);
                 self.visit_expr(&node.value);
             }
             Expr::Named(node) => {
                 self.metrics.expression_operations += 1;
                 self.metrics.mutations += 1;
+                self.push(ScoreComponent::ExpressionOperations, 1, node.range);
                 self.visit_expr(&node.value);
                 self.visit_expr(&node.target);
             }
             Expr::If(node) => {
-                self.branch();
+                self.branch(node.range);
                 self.visit_expr(&node.test);
                 self.with_depth(|visitor| visitor.visit_expr(&node.body));
                 self.with_depth(|visitor| visitor.visit_expr(&node.orelse));
@@ -1202,5 +1366,61 @@ class Box(Base(make())):
                 .unwrap_err()
                 .contains("BOM")
         );
+    }
+
+    #[test]
+    fn token_index_matches_the_reference_range_scan() {
+        let source = "def f(value):\n    return value + 1  # comment\n";
+        let options =
+            ParseOptions::from(PySourceType::Python).with_target_version(PythonVersion::PY314);
+        let parsed = parse_unchecked(source, options);
+        let index = TokenIndex::new(parsed.tokens());
+        for start in (0..=source.len()).step_by(3) {
+            for end in (start..=source.len()).step_by(5) {
+                let range = TextRange::new(text_size(start), text_size(end));
+                let reference = parsed
+                    .tokens()
+                    .iter()
+                    .filter(|token| {
+                        let token_range = token.range();
+                        token_range.start() >= range.start()
+                            && token_range.end() <= range.end()
+                            && is_counted_token(token.kind())
+                    })
+                    .count();
+                assert_eq!(index.count_in(range), reference, "range {start}..{end}");
+            }
+        }
+    }
+
+    #[test]
+    fn token_index_shape_is_linear_and_queries_use_prefix_counts() {
+        let source = "x + 1\n".repeat(256);
+        let options =
+            ParseOptions::from(PySourceType::Python).with_target_version(PythonVersion::PY314);
+        let parsed = parse_unchecked(&source, options);
+        let index = TokenIndex::new(parsed.tokens());
+        assert_eq!(index.prefix.len(), index.starts.len() + 1);
+        assert_eq!(index.total(), index.starts.len());
+        let full = TextRange::new(TextSize::new(0), text_size(source.len()));
+        assert_eq!(index.count_in(full), index.total());
+    }
+
+    #[test]
+    fn score_contributions_reconcile_for_python_units() {
+        let file = analyze_source(
+            "def f(value):\n    if value and value > 1:\n        return call(value)\n",
+        );
+        for function in file.functions {
+            assert_eq!(
+                function.score.units,
+                function
+                    .score
+                    .contributions
+                    .iter()
+                    .map(|contribution| contribution.units)
+                    .sum::<usize>()
+            );
+        }
     }
 }

@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::explain;
 use crate::identity;
-use crate::model::{AnalysisContract, OutputFormat};
+use crate::model::{AnalysisContract, OutputFormat, SCHEMA_VERSION};
 
 const COMPONENT_NAMES: [&str; 8] = [
     "boundary",
@@ -69,9 +70,30 @@ pub fn render_comparison(
     }
 }
 
+/// Render a deliberately truncated comparison view with explicit counts and
+/// aggregate context. The full comparison remains available through
+/// `render_comparison`.
+pub fn render_compact_comparison(
+    comparison: &Comparison,
+    format: OutputFormat,
+    top: usize,
+) -> Result<String, serde_json::Error> {
+    match format {
+        OutputFormat::Text => Ok(crate::output::render_compact_diff(
+            &explain::compact_diff(comparison, top),
+            format,
+        )?),
+        OutputFormat::Json => {
+            crate::output::render_compact_diff(&explain::compact_diff(comparison, top), format)
+        }
+    }
+}
+
 /// A report comparison that passed all like-for-like validation checks.
 #[derive(Clone, Debug, Serialize)]
 pub struct Comparison {
+    pub report_kind: String,
+    pub schema_version: u32,
     pub comparable: bool,
     pub before: ReportMetadata,
     pub after: ReportMetadata,
@@ -94,10 +116,10 @@ pub struct Comparison {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ReportMetadata {
+    pub schema_version: u32,
     pub path: String,
     pub root: String,
     pub version: String,
-    pub schema_version: String,
     pub evidence_version: String,
     pub model: String,
     pub analysis_contract: AnalysisContract,
@@ -400,6 +422,8 @@ fn compare_reports(
     warnings.append(&mut match_warnings);
 
     Ok(Comparison {
+        report_kind: "diff".to_owned(),
+        schema_version: SCHEMA_VERSION,
         comparable: true,
         before: metadata(before_path, &before),
         after: metadata(after_path, &after),
@@ -463,11 +487,10 @@ fn validate_identity(label: &str, report: &InputReport, issues: &mut Vec<String>
     if report.root.trim().is_empty() {
         issues.push(format!("{label} report has an empty analyzed root"));
     }
-    if report.schema_version != identity::REPORT_SCHEMA_VERSION {
+    if report.report_kind != "analysis" {
         issues.push(format!(
-            "{label} report has schema {:?}; expected {}; compact or non-analysis reports cannot be used as baselines",
-            report.schema_version,
-            identity::REPORT_SCHEMA_VERSION
+            "{label} report has kind {:?}; only complete analysis reports can be used as baselines",
+            report.report_kind
         ));
     }
     if report.evidence_version != identity::EVIDENCE_VERSION {
@@ -480,6 +503,12 @@ fn validate_identity(label: &str, report: &InputReport, issues: &mut Vec<String>
     if !report.analysis_contract.is_complete() {
         issues.push(format!(
             "{label} report has an incomplete analysis contract; regenerate it with a multi-language Kompass"
+        ));
+    }
+    if report.schema_version != 0 && report.schema_version != SCHEMA_VERSION {
+        issues.push(format!(
+            "{label} report schema version is {}, but this Kompass supports {}",
+            report.schema_version, SCHEMA_VERSION
         ));
     }
 }
@@ -1236,10 +1265,14 @@ fn score_components(score: &InputScore) -> [usize; 8] {
 
 fn metadata(path: &Path, report: &InputReport) -> ReportMetadata {
     ReportMetadata {
+        schema_version: if report.schema_version == 0 {
+            SCHEMA_VERSION
+        } else {
+            report.schema_version
+        },
         path: path.to_string_lossy().into_owned(),
         root: report.root.clone(),
         version: report.version.clone(),
-        schema_version: report.schema_version.clone(),
         evidence_version: report.evidence_version.clone(),
         model: report.model.clone(),
         analysis_contract: report.analysis_contract.clone(),
@@ -1628,10 +1661,12 @@ impl FunctionKey {
 
 #[derive(Clone, Debug, Deserialize)]
 struct InputReport {
+    #[serde(default)]
+    report_kind: String,
+    #[serde(default)]
+    schema_version: u32,
     tool: String,
     version: String,
-    #[serde(default)]
-    schema_version: String,
     #[serde(default)]
     evidence_version: String,
     model: String,
@@ -1779,9 +1814,10 @@ mod tests {
         source_tokens: usize,
     ) -> InputReport {
         InputReport {
+            report_kind: "analysis".to_owned(),
+            schema_version: SCHEMA_VERSION,
             tool: "kompass".to_owned(),
             version: "0.1.0".to_owned(),
-            schema_version: identity::REPORT_SCHEMA_VERSION.to_owned(),
             evidence_version: identity::EVIDENCE_VERSION.to_owned(),
             model: "test-model".to_owned(),
             analysis_contract: AnalysisContract {
@@ -2394,7 +2430,7 @@ mod tests {
             0,
             0,
         );
-        before.schema_version.clear();
+        before.report_kind.clear();
         let after = before.clone();
         let error = compare_reports(
             Path::new("before.json"),

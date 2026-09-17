@@ -3,10 +3,10 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
     Arm, BinOp, Expr, ExprAssign, ExprBinary, ExprCast, ExprIf, ExprIndex, ExprMatch,
-    ExprReference, ExprUnary, ExprUnsafe, Stmt, UnOp,
+    ExprReference, ExprUnary, ExprUnsafe, FnArg, Signature, Stmt, UnOp,
 };
 
-use crate::model::{Metrics, Score};
+use crate::model::{Location, Metrics, Score, ScoreComponent, ScoreContribution};
 use crate::tokens::TokenPosition;
 
 /// Measure the structural signals that are available from a Rust syntax
@@ -130,6 +130,364 @@ pub fn score(metrics: &Metrics) -> Score {
         parameter_units,
         match_arm_units,
         expression_operation_units: metrics.expression_operations,
+        contributions: Vec::new(),
+    }
+}
+
+/// Score a unit and attach the fixed eight-component explanation envelope.
+///
+/// The current frontends expose syntax metrics before they expose a shared
+/// evidence graph, so each component is located at the unit span. This keeps
+/// explanations useful and, more importantly, makes their units auditable:
+/// the contribution sum is exactly the score produced by `structural-v4`.
+pub fn score_with_location(metrics: &Metrics, location: Location) -> Score {
+    let mut scored = score(metrics);
+    scored.contributions = aggregate_contributions(metrics, &location);
+    scored
+}
+
+/// Attach frontend-collected source events and retain exact score units. A
+/// defensive aggregate fallback keeps serialized reports reconciled even if a
+/// future frontend adds a metric without adding a corresponding event.
+pub fn score_with_contributions(
+    metrics: &Metrics,
+    location: Location,
+    contributions: Vec<ScoreContribution>,
+) -> Score {
+    let mut scored = score(metrics);
+    let contribution_units = contributions
+        .iter()
+        .map(|contribution| contribution.units)
+        .fold(0usize, usize::saturating_add);
+    scored.contributions = if contribution_units == scored.units {
+        contributions
+    } else {
+        aggregate_contributions(metrics, &location)
+    };
+    debug_assert_eq!(
+        scored.units,
+        scored
+            .contributions
+            .iter()
+            .map(|contribution| contribution.units)
+            .fold(0usize, usize::saturating_add)
+    );
+    scored
+}
+
+fn aggregate_contributions(metrics: &Metrics, location: &Location) -> Vec<ScoreContribution> {
+    vec![
+        contribution(ScoreComponent::Boundary, 10, location),
+        contribution(
+            ScoreComponent::ControlDecisions,
+            metrics.control_decisions.saturating_mul(10),
+            location,
+        ),
+        contribution(
+            ScoreComponent::NestingPenalty,
+            metrics.nesting_penalty.saturating_mul(10),
+            location,
+        ),
+        contribution(
+            ScoreComponent::BooleanOperators,
+            metrics.boolean_operators.saturating_mul(5),
+            location,
+        ),
+        contribution(
+            ScoreComponent::ExpressionOperations,
+            metrics.expression_operations,
+            location,
+        ),
+        contribution(
+            ScoreComponent::CallSites,
+            metrics.call_sites.saturating_mul(2),
+            location,
+        ),
+        contribution(
+            ScoreComponent::ExplicitParameters,
+            metrics.explicit_parameters.saturating_mul(2),
+            location,
+        ),
+        contribution(
+            ScoreComponent::MatchArms,
+            metrics.match_arms.saturating_mul(2),
+            location,
+        ),
+    ]
+}
+
+fn contribution(component: ScoreComponent, units: usize, location: &Location) -> ScoreContribution {
+    ScoreContribution {
+        component,
+        units,
+        location: location.clone(),
+    }
+}
+
+/// Collect source events for an ordinary Rust function or method. The visitor
+/// mirrors `MetricsVisitor`, including opaque nested callable bodies, so the
+/// event sum remains identical to the frozen score.
+pub fn rust_function_contributions(
+    block: &syn::Block,
+    signature: &Signature,
+    location: Location,
+) -> Vec<ScoreContribution> {
+    let mut visitor = RustContributionVisitor::new(0);
+    visitor.push(ScoreComponent::Boundary, 10, location.clone());
+    for input in &signature.inputs {
+        if !matches!(input, FnArg::Receiver(_)) {
+            visitor.push(
+                ScoreComponent::ExplicitParameters,
+                2,
+                span_location(input.span()),
+            );
+        }
+    }
+    visitor.visit_block(block);
+    visitor.contributions
+}
+
+/// Collect source events for a Rust closure, retaining the lexical depth at
+/// which the closure was created.
+pub fn rust_closure_contributions(
+    body: &Expr,
+    inputs: &syn::punctuated::Punctuated<syn::Pat, syn::Token![,]>,
+    base_depth: usize,
+    location: Location,
+) -> Vec<ScoreContribution> {
+    let mut visitor = RustContributionVisitor::new(base_depth);
+    visitor.push(ScoreComponent::Boundary, 10, location.clone());
+    for input in inputs {
+        visitor.push(
+            ScoreComponent::ExplicitParameters,
+            2,
+            span_location(input.span()),
+        );
+    }
+    visitor.visit_expr(body);
+    visitor.contributions
+}
+
+/// Collect source events for a const or static initializer expression.
+pub fn rust_initializer_contributions(
+    expression: &Expr,
+    location: Location,
+) -> Vec<ScoreContribution> {
+    let mut visitor = RustContributionVisitor::new(0);
+    visitor.push(ScoreComponent::Boundary, 10, location.clone());
+    visitor.visit_expr(expression);
+    visitor.contributions
+}
+
+fn span_location(span: Span) -> Location {
+    let start = span.start();
+    let end = span.end();
+    Location {
+        start: crate::model::Position {
+            line: start.line,
+            column: start.column + 1,
+        },
+        end: crate::model::Position {
+            line: end.line,
+            column: end.column + 1,
+        },
+    }
+}
+
+#[derive(Default)]
+struct RustContributionVisitor {
+    depth: usize,
+    contributions: Vec<ScoreContribution>,
+}
+
+impl RustContributionVisitor {
+    fn new(depth: usize) -> Self {
+        Self {
+            depth,
+            contributions: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, component: ScoreComponent, units: usize, location: Location) {
+        self.contributions.push(ScoreContribution {
+            component,
+            units,
+            location,
+        });
+    }
+
+    fn branch(&mut self, span: Span) {
+        self.push(ScoreComponent::ControlDecisions, 10, span_location(span));
+        if self.depth > 0 {
+            self.push(
+                ScoreComponent::NestingPenalty,
+                self.depth.saturating_mul(10),
+                span_location(span),
+            );
+        }
+    }
+
+    fn with_depth(&mut self, visit: impl FnOnce(&mut Self)) {
+        self.depth += 1;
+        visit(self);
+        self.depth -= 1;
+    }
+}
+
+impl<'ast> Visit<'ast> for RustContributionVisitor {
+    fn visit_expr_if(&mut self, node: &'ast ExprIf) {
+        self.branch(node.if_token.span());
+        self.visit_expr(&node.cond);
+        self.with_depth(|visitor| visitor.visit_block(&node.then_branch));
+        if let Some((_, else_branch)) = &node.else_branch {
+            if let Expr::If(else_if) = else_branch.as_ref() {
+                self.visit_expr_if(else_if);
+            } else {
+                self.with_depth(|visitor| visitor.visit_expr(else_branch));
+            }
+        }
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast ExprMatch) {
+        self.branch(node.match_token.span());
+        for arm in &node.arms {
+            self.push(ScoreComponent::MatchArms, 2, span_location(arm.span()));
+        }
+        self.visit_expr(&node.expr);
+        self.with_depth(|visitor| {
+            for arm in &node.arms {
+                visitor.visit_arm(arm);
+            }
+        });
+    }
+
+    fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+        self.branch(node.loop_token.span());
+        self.with_depth(|visitor| visitor.visit_block(&node.body));
+    }
+
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        self.branch(node.for_token.span());
+        self.visit_pat(&node.pat);
+        self.visit_expr(&node.expr);
+        self.with_depth(|visitor| visitor.visit_block(&node.body));
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        self.branch(node.while_token.span());
+        self.visit_expr(&node.cond);
+        self.with_depth(|visitor| visitor.visit_block(&node.body));
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast ExprBinary) {
+        if matches!(node.op, BinOp::And(_) | BinOp::Or(_)) {
+            self.push(
+                ScoreComponent::BooleanOperators,
+                5,
+                span_location(node.op.span()),
+            );
+        } else {
+            self.push(
+                ScoreComponent::ExpressionOperations,
+                1,
+                span_location(node.op.span()),
+            );
+        }
+        visit::visit_expr_binary(self, node);
+    }
+
+    fn visit_expr_unary(&mut self, node: &'ast ExprUnary) {
+        if matches!(node.op, UnOp::Neg(_) | UnOp::Not(_) | UnOp::Deref(_)) {
+            self.push(
+                ScoreComponent::ExpressionOperations,
+                1,
+                span_location(node.op.span()),
+            );
+        }
+        visit::visit_expr_unary(self, node);
+    }
+
+    fn visit_expr_index(&mut self, node: &'ast ExprIndex) {
+        self.push(
+            ScoreComponent::ExpressionOperations,
+            1,
+            span_location(node.span()),
+        );
+        visit::visit_expr_index(self, node);
+    }
+
+    fn visit_expr_cast(&mut self, node: &'ast ExprCast) {
+        self.push(
+            ScoreComponent::ExpressionOperations,
+            1,
+            span_location(node.as_token.span()),
+        );
+        visit::visit_expr_cast(self, node);
+    }
+
+    fn visit_expr_closure(&mut self, _node: &'ast syn::ExprClosure) {}
+
+    fn visit_arm(&mut self, node: &'ast Arm) {
+        if let Some((_, guard)) = &node.guard {
+            self.push(
+                ScoreComponent::ControlDecisions,
+                10,
+                span_location(guard.span()),
+            );
+            if self.depth > 0 {
+                self.push(
+                    ScoreComponent::NestingPenalty,
+                    self.depth.saturating_mul(10),
+                    span_location(guard.span()),
+                );
+            }
+        }
+        visit::visit_arm(self, node);
+    }
+
+    fn visit_expr_assign(&mut self, node: &'ast ExprAssign) {
+        self.push(
+            ScoreComponent::ExpressionOperations,
+            1,
+            span_location(node.eq_token.span()),
+        );
+        visit::visit_expr_assign(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        self.push(ScoreComponent::CallSites, 2, span_location(node.span()));
+        visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        self.push(ScoreComponent::CallSites, 2, span_location(node.span()));
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        if let Some(init) = &node.init
+            && let Some((_, diverge)) = &init.diverge
+        {
+            self.branch(node.span());
+            self.visit_pat(&node.pat);
+            self.visit_expr(&init.expr);
+            self.with_depth(|visitor| {
+                if let Expr::Block(block) = diverge.as_ref() {
+                    visitor.visit_block(&block.block);
+                } else {
+                    visitor.visit_expr(diverge);
+                }
+            });
+            return;
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_stmt(&mut self, node: &'ast Stmt) {
+        if matches!(node, Stmt::Item(_)) {
+            return;
+        }
+        visit::visit_stmt(self, node);
     }
 }
 
@@ -611,6 +969,38 @@ mod tests {
 
         assert_eq!(parent.expression_operations, 0);
         assert_eq!(child.expression_operations, 1);
+    }
+
+    #[test]
+    fn source_contributions_reconcile_for_rust_units() {
+        let item: syn::ItemFn = syn::parse_str(
+            "fn f(value: bool, other: i32) { if value && other > 0 { call(other); } }",
+        )
+        .unwrap();
+        let metrics = measure(&item.block, 1, item.sig.inputs.len(), item.sig.inputs.len());
+        let location = Location {
+            start: crate::model::Position { line: 1, column: 1 },
+            end: crate::model::Position {
+                line: 1,
+                column: 81,
+            },
+        };
+        let contributions = rust_function_contributions(&item.block, &item.sig, location.clone());
+        let scored = score_with_contributions(&metrics, location, contributions);
+        assert_eq!(
+            scored.units,
+            scored
+                .contributions
+                .iter()
+                .map(|contribution| contribution.units)
+                .sum::<usize>()
+        );
+        assert!(
+            scored
+                .contributions
+                .iter()
+                .any(|contribution| contribution.component == ScoreComponent::BooleanOperators)
+        );
     }
 
     #[test]

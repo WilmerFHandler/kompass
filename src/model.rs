@@ -17,14 +17,17 @@ pub const FRONTEND_CONTRACT: &str = "rust-syn-v1;python-ruff-0.0.10-py314";
 /// or discovery changes.
 pub const ANALYSIS_CONTRACT: &str = "analysis-v1";
 
+/// Version of the serialized report envelope and its machine-readable views.
+pub const SCHEMA_VERSION: u32 = 2;
+
 /// A machine-readable analysis report. JSON output serializes this structure
 /// directly, so adding fields should remain backwards-compatible.
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
+    pub report_kind: String,
+    pub schema_version: u32,
     pub tool: String,
     pub version: String,
-    /// Version of the serialized report shape.
-    pub schema_version: String,
     /// Version of the source evidence fields attached to each unit.
     pub evidence_version: String,
     pub model: String,
@@ -252,13 +255,13 @@ impl FunctionKind {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Location {
     pub start: Position,
     pub end: Position,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Position {
     /// One-based source line.
     pub line: usize,
@@ -315,6 +318,60 @@ pub struct Score {
     pub match_arm_units: usize,
     /// One-tenth-unit charge for each expression operation.
     pub expression_operation_units: usize,
+    /// Source-located contributions that add up exactly to `units`.
+    pub contributions: Vec<ScoreContribution>,
+}
+
+/// One of the eight additive components in the structural-v4 score.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoreComponent {
+    Boundary,
+    ControlDecisions,
+    NestingPenalty,
+    BooleanOperators,
+    ExpressionOperations,
+    CallSites,
+    ExplicitParameters,
+    MatchArms,
+}
+
+impl ScoreComponent {
+    pub const ALL: [Self; 8] = [
+        Self::Boundary,
+        Self::ControlDecisions,
+        Self::NestingPenalty,
+        Self::BooleanOperators,
+        Self::ExpressionOperations,
+        Self::CallSites,
+        Self::ExplicitParameters,
+        Self::MatchArms,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Boundary => "boundary",
+            Self::ControlDecisions => "control decisions",
+            Self::NestingPenalty => "nesting penalty",
+            Self::BooleanOperators => "boolean operators",
+            Self::ExpressionOperations => "expression operations",
+            Self::CallSites => "call sites",
+            Self::ExplicitParameters => "explicit parameters",
+            Self::MatchArms => "match arms",
+        }
+    }
+}
+
+/// A score contribution located in the source span that produced it.
+///
+/// The units use the same integer-tenth convention as `Score::units`. A
+/// frontend may aggregate several syntax events into one span, but the sum of
+/// all contributions is always exactly the reported score.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScoreContribution {
+    pub component: ScoreComponent,
+    pub units: usize,
+    pub location: Location,
 }
 
 #[derive(Clone, Debug, Serialize)]

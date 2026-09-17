@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use kompass::{OutputFormat, SortBy, analyze, diff, discover, output};
+use kompass::{OutputFormat, SortBy, analyze, diff, discover, explain, output};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -46,6 +46,17 @@ invocation source as written without expansion, including built-in macros.
 rule bodies separately. Compare them with burden; lower score is a review signal,
 not proof that code is cleaner or correct. Semantic module boundaries and coupling
 are not measured; review those manually and do not blindly minimize the score.
+
+Use `--format json --compact --top N` for a bounded machine-readable analysis
+view. It is marked `report_kind: "analysis_compact"` and retains full scope,
+coverage, and aggregate values alongside explicit `returned` and `total` counts.
+Use `kompass explain PATH --line N` to inspect every callable containing a line;
+the output marks the innermost candidate, shows all eight score components and
+their source locations, and reports semantic evidence as unavailable until that
+module exists.
+
+`kompass diff BEFORE.json AFTER.json --format json --compact --top N` uses the
+same explicit truncation contract with `report_kind: "diff_compact"`.
 
 Const and static initializers appear in `files[].functions[]` as callable-like
 `const_initializer` or `static_initializer` units. Their initializer
@@ -97,6 +108,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
 
+    /// Return only the top N callables in an explicitly marked compact JSON view.
+    #[arg(long)]
+    compact: bool,
+
     /// Show the test ranking instead of the production ranking.
     #[arg(long, conflicts_with = "all")]
     tests: bool,
@@ -118,6 +133,9 @@ struct Cli {
 enum Command {
     /// Compare two complete JSON reports from the same analyzed scope.
     Diff(DiffArgs),
+
+    /// Explain every callable containing a source line.
+    Explain(ExplainArgs),
 }
 
 #[derive(Debug, Args)]
@@ -134,6 +152,14 @@ struct DiffArgs {
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
 
+    /// Return only the top N changes in an explicitly marked compact JSON view.
+    #[arg(long)]
+    compact: bool,
+
+    /// Number of callable changes to return in compact output.
+    #[arg(long, default_value_t = 10, value_name = "N")]
+    top: usize,
+
     /// Allow added or removed files, with an explicit scope warning.
     #[arg(long)]
     allow_file_changes: bool,
@@ -141,6 +167,21 @@ struct DiffArgs {
     /// Allow different absolute report roots while keeping relative scope checks.
     #[arg(long)]
     allow_root_change: bool,
+}
+
+#[derive(Debug, Args)]
+struct ExplainArgs {
+    /// Source file whose containing callables should be reported.
+    #[arg(value_name = "PATH")]
+    path: PathBuf,
+
+    /// One-based source line to explain.
+    #[arg(long, value_name = "N")]
+    line: usize,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    format: Format,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -195,7 +236,7 @@ impl From<Sort> for SortBy {
 fn main() {
     let cli = Cli::parse();
 
-    if let Some(Command::Diff(args)) = cli.command {
+    if let Some(Command::Diff(args)) = cli.command.as_ref() {
         let comparison = match diff::compare_paths_with_options(
             &args.before,
             &args.after,
@@ -210,11 +251,21 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        let rendered = match diff::render_comparison(&comparison, args.format.into()) {
-            Ok(rendered) => rendered,
-            Err(error) => {
-                eprintln!("kompass: could not render comparison: {error}");
-                std::process::exit(2);
+        let rendered = if args.compact {
+            match diff::render_compact_comparison(&comparison, args.format.into(), args.top) {
+                Ok(rendered) => rendered,
+                Err(error) => {
+                    eprintln!("kompass: could not render comparison: {error}");
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            match diff::render_comparison(&comparison, args.format.into()) {
+                Ok(rendered) => rendered,
+                Err(error) => {
+                    eprintln!("kompass: could not render comparison: {error}");
+                    std::process::exit(2);
+                }
             }
         };
         let mut stdout = io::BufWriter::new(io::stdout().lock());
@@ -231,6 +282,53 @@ fn main() {
         }
     }
 
+    if let Some(Command::Explain(args)) = cli.command.as_ref() {
+        let discovered =
+            match discover::discover_with_language(&args.path, discover::LanguageFilter::All) {
+                Ok(files) => files,
+                Err(error) => {
+                    eprintln!("kompass: {error}");
+                    std::process::exit(2);
+                }
+            };
+        let report = analyze::analyze(&args.path, discovered);
+        let explanation = match explain::explain_report(&report, &args.path, args.line) {
+            Ok(explanation) => explanation,
+            Err(error) => {
+                eprintln!("kompass: {error}");
+                std::process::exit(2);
+            }
+        };
+        let rendered = match output::render_explain(&explanation, args.format.into()) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                eprintln!("kompass: could not render explanation: {error}");
+                std::process::exit(2);
+            }
+        };
+        let mut stdout = io::BufWriter::new(io::stdout().lock());
+        match stdout
+            .write_all(rendered.as_bytes())
+            .and_then(|_| stdout.flush())
+        {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return,
+            Err(error) => {
+                eprintln!("kompass: {error}");
+                std::process::exit(2);
+            }
+        }
+        if report.has_errors() {
+            std::process::exit(2);
+        }
+        return;
+    }
+
+    if cli.compact && cli.format != Format::Json {
+        eprintln!("kompass: --compact requires --format json");
+        std::process::exit(2);
+    }
+
     let discovered = match discover::discover_with_language(&cli.path, cli.language.into()) {
         Ok(files) => files,
         Err(error) => {
@@ -240,14 +338,30 @@ fn main() {
     };
 
     let report = analyze::analyze(&cli.path, discovered);
-    match output::write_report(
-        &report,
-        cli.format.into(),
-        cli.top,
-        cli.tests,
-        cli.all,
-        cli.sort.into(),
-    ) {
+    let rendered = if cli.compact {
+        output::render_compact_analysis(
+            &explain::compact_analysis(&report, cli.top, cli.tests, cli.all, cli.sort.into()),
+            OutputFormat::Json,
+        )
+        .map_err(|error| io::Error::other(format!("could not render report: {error}")))
+    } else {
+        output::render_report(
+            &report,
+            cli.format.into(),
+            cli.top,
+            cli.tests,
+            cli.all,
+            cli.sort.into(),
+        )
+        .map_err(|error| io::Error::other(format!("could not render report: {error}")))
+    };
+    let result = rendered.and_then(|rendered| {
+        let mut stdout = io::BufWriter::new(io::stdout().lock());
+        stdout
+            .write_all(rendered.as_bytes())
+            .and_then(|_| stdout.flush())
+    });
+    match result {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return,
         Err(error) => {

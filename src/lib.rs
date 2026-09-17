@@ -3,6 +3,7 @@
 pub mod analyze;
 pub mod diff;
 pub mod discover;
+pub mod explain;
 pub mod identity;
 pub mod model;
 pub mod output;

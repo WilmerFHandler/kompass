@@ -96,7 +96,7 @@ fn json_report_contains_separate_categories_and_tokens() {
     assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["model"], "structural-v4");
-    assert_eq!(report["schema_version"], "report-v2");
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["evidence_version"], "evidence-v1");
     assert_eq!(report["analysis_contract"]["version"], "analysis-v1");
     assert_eq!(
@@ -284,6 +284,89 @@ fn tests_and_all_are_rejected_by_the_cli() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cannot be used with"));
+}
+
+#[test]
+fn compact_json_is_explicitly_truncated_and_retains_aggregates() {
+    let root = temporary_directory("compact");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("main.rs"),
+        "fn first(value: bool) { if value {} }\nfn second() {}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args([
+            "--format",
+            "json",
+            "--compact",
+            "--top",
+            "1",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["report_kind"], "analysis_compact");
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["returned"], 1);
+    assert_eq!(value["total"], 2);
+    assert!(value["scope"].is_object());
+    assert!(value["coverage"].is_object());
+    assert!(value["aggregates"]["summary"].is_object());
+    assert_eq!(value["functions"].as_array().unwrap().len(), 1);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn explain_reports_all_containing_candidates_and_marks_innermost() {
+    let root = temporary_directory("explain");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = "fn outer(value: bool) {\n    if value {\n        let inner = || value && true;\n        let _ = inner;\n    }\n}\n";
+    let path = root.join("main.rs");
+    std::fs::write(&path, source).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args([
+            "explain",
+            path.to_str().unwrap(),
+            "--line",
+            "3",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["report_kind"], "explain");
+    assert_eq!(value["scope"]["line"], 3);
+    let candidates = value["candidates"].as_array().unwrap();
+    assert!(candidates.len() >= 2);
+    assert_eq!(
+        candidates
+            .iter()
+            .filter(|candidate| candidate["innermost"] == true)
+            .count(),
+        1
+    );
+    for candidate in candidates {
+        assert_eq!(candidate["components"].as_array().unwrap().len(), 8);
+        assert!(candidate["evidence"].is_array());
+    }
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

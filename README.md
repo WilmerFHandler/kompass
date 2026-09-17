@@ -53,6 +53,7 @@ kompass [PATH]                 Analyze the current directory by default
     --language all|rust|python
                                Select source languages for directory walks (default all)
     --format text|json         Choose human or machine-readable output
+    --compact                  With JSON, return a bounded view marked `analysis_compact`
     --top N                    Show N callables in text output (default 10)
     --sort score|depth|size    Order text hotspots by score, max depth, or tokens
     --tests                    Show test hotspots instead of production hotspots
@@ -63,7 +64,23 @@ kompass diff BEFORE.json AFTER.json
     --format text|json         Choose human or machine-readable comparison output
     --allow-file-changes       Permit file-set changes with an explicit warning
     --allow-root-change        Permit equivalent absolute roots while retaining relative scope checks
+    --compact                  Return a bounded diff marked `diff_compact`
+    --top N                    Number of callable changes in compact output (default 10)
+
+ kompass explain PATH --line N [--format text|json]
+                                Explain every containing callable and mark the innermost one
 ```
+
+Compact JSON keeps the complete model, analysis contract, scope, coverage, and aggregate
+values while returning only the selected top entries. `returned` and `total` make truncation
+explicit, and `report_kind` distinguishes `analysis_compact` and `diff_compact` from full
+reports. Explain output is freshly analyzed for the requested source file and line; when
+several nested units contain the line, every candidate is returned and exactly one is marked
+`innermost`. Each candidate exposes all eight score components with source locations. Semantic
+evidence is currently represented by an explicit `unavailable` placeholder.
+
+Every serialized view includes `schema_version` so consumers can reject incompatible envelopes
+before reading fields. Full analysis reports identify themselves with `report_kind: "analysis"`.
 
 ### Agent workflow
 

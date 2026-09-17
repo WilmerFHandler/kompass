@@ -11,9 +11,6 @@ use crate::model::{FunctionReport, Language, Position};
 /// Version of the unit identity and lexical fingerprint contract.
 pub const IDENTITY_CONTRACT: &str = "identity-v1";
 
-/// Version of the complete report serialization/evidence contract.
-pub const REPORT_SCHEMA_VERSION: &str = "report-v2";
-
 /// Version of the evidence fields used to explain a comparison match.
 pub const EVIDENCE_VERSION: &str = "evidence-v1";
 

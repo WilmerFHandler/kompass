@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 
+use crate::explain::{CompactAnalysis, CompactDiff, ExplainReport};
 use crate::model::{
     Category, CategorySummary, ErrorKind, FunctionReport, Language, LanguageCounts, OutputFormat,
     Report, SortBy,
@@ -38,6 +39,174 @@ pub fn render_report(
         }
         OutputFormat::Text => Ok(render_text(report, top, tests, all, sort)),
     }
+}
+
+/// Render the explicitly truncated analysis view. It is intentionally a
+/// separate function so callers cannot accidentally serialize it as a full
+/// `Report`.
+pub fn render_compact_analysis(
+    compact: &CompactAnalysis,
+    format: OutputFormat,
+) -> Result<String, serde_json::Error> {
+    match format {
+        OutputFormat::Json => {
+            let mut output = serde_json::to_string_pretty(compact)?;
+            output.push('\n');
+            Ok(output)
+        }
+        OutputFormat::Text => Ok(render_compact_analysis_text(compact)),
+    }
+}
+
+pub fn render_compact_diff(
+    compact: &CompactDiff,
+    format: OutputFormat,
+) -> Result<String, serde_json::Error> {
+    match format {
+        OutputFormat::Json => {
+            let mut output = serde_json::to_string_pretty(compact)?;
+            output.push('\n');
+            Ok(output)
+        }
+        OutputFormat::Text => Ok(render_compact_diff_text(compact)),
+    }
+}
+
+pub fn render_explain(
+    explanation: &ExplainReport,
+    format: OutputFormat,
+) -> Result<String, serde_json::Error> {
+    match format {
+        OutputFormat::Json => {
+            let mut output = serde_json::to_string_pretty(explanation)?;
+            output.push('\n');
+            Ok(output)
+        }
+        OutputFormat::Text => Ok(render_explain_text(explanation)),
+    }
+}
+
+fn render_compact_analysis_text(compact: &CompactAnalysis) -> String {
+    let mut output = String::new();
+    writeln!(
+        output,
+        "Kompass compact analysis · {} · {}",
+        compact.model, compact.scope.root
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Returned {} of {} {} callables",
+        compact.returned,
+        compact.total,
+        if compact.selected_categories.len() == 1 {
+            category_label(compact.selected_categories[0])
+        } else {
+            "selected"
+        }
+    )
+    .unwrap();
+    for function in &compact.functions {
+        writeln!(
+            output,
+            "  {:>5}  {}:{}:{}  {}",
+            format_score(function.score.units),
+            function.path,
+            function.location.start.line,
+            function.location.start.column,
+            function.name
+        )
+        .unwrap();
+    }
+    output
+}
+
+fn render_compact_diff_text(compact: &CompactDiff) -> String {
+    let mut output = String::new();
+    writeln!(
+        output,
+        "Kompass compact diff · {} · {}",
+        compact.model, compact.scope.root
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Returned {} of {} callable changes",
+        compact.returned, compact.total
+    )
+    .unwrap();
+    for function in &compact.functions {
+        writeln!(
+            output,
+            "  {:+.1}  {}:{}  {}",
+            function.delta as f64 / 10.0,
+            function.path,
+            function.category,
+            function.name
+        )
+        .unwrap();
+    }
+    output
+}
+
+fn render_explain_text(explanation: &ExplainReport) -> String {
+    let mut output = String::new();
+    writeln!(
+        output,
+        "Kompass explain · {}:{} · {}",
+        explanation.scope.path, explanation.scope.line, explanation.model
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "{} containing candidates · {} analyzed files",
+        explanation.total, explanation.coverage.analyzed_files
+    )
+    .unwrap();
+    if explanation.candidates.is_empty() {
+        writeln!(output, "No callable or initializer contains this line.").unwrap();
+    }
+    for candidate in &explanation.candidates {
+        writeln!(
+            output,
+            "\n{} {} · score {} · {}:{}:{}-{}:{}",
+            if candidate.innermost {
+                "Innermost:"
+            } else {
+                "Candidate:"
+            },
+            candidate.name,
+            candidate.score.display,
+            explanation.scope.path,
+            candidate.location.start.line,
+            candidate.location.start.column,
+            candidate.location.end.line,
+            candidate.location.end.column
+        )
+        .unwrap();
+        for component in &candidate.components {
+            let locations = component
+                .locations
+                .iter()
+                .map(|location| format!("{}:{}", location.start.line, location.start.column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(
+                output,
+                "  {:<24} {:>5} units{}",
+                component.component.label(),
+                component.units,
+                if locations.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {locations}")
+                }
+            )
+            .unwrap();
+        }
+        writeln!(output, "  evidence · unavailable · syntax-only explanation").unwrap();
+    }
+    output
 }
 
 fn render_text(report: &Report, top: usize, tests: bool, all: bool, sort: SortBy) -> String {
@@ -368,9 +537,10 @@ mod tests {
     #[test]
     fn text_output_explains_score_and_token_count() {
         let report = Report {
+            report_kind: "analysis".to_owned(),
+            schema_version: crate::model::SCHEMA_VERSION,
             tool: "kompass".to_owned(),
             version: "0.1.0".to_owned(),
-            schema_version: crate::identity::REPORT_SCHEMA_VERSION.to_owned(),
             evidence_version: crate::identity::EVIDENCE_VERSION.to_owned(),
             model: SCORE_MODEL.to_owned(),
             analysis_contract: AnalysisContract::current(),
@@ -491,9 +661,10 @@ mod tests {
             },
         };
         let report = Report {
+            report_kind: "analysis".to_owned(),
+            schema_version: crate::model::SCHEMA_VERSION,
             tool: "kompass".to_owned(),
             version: "0.1.0".to_owned(),
-            schema_version: crate::identity::REPORT_SCHEMA_VERSION.to_owned(),
             evidence_version: crate::identity::EVIDENCE_VERSION.to_owned(),
             model: SCORE_MODEL.to_owned(),
             analysis_contract: AnalysisContract::current(),

@@ -151,9 +151,10 @@ pub fn analyze_with_frontends(
     };
 
     Report {
+        report_kind: "analysis".to_owned(),
+        schema_version: crate::model::SCHEMA_VERSION,
         tool: "kompass".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        schema_version: identity::REPORT_SCHEMA_VERSION.to_owned(),
         evidence_version: identity::EVIDENCE_VERSION.to_owned(),
         model: SCORE_MODEL.to_owned(),
         analysis_contract: AnalysisContract::current(),
@@ -883,6 +884,10 @@ fn make_function_report(
         },
     );
 
+    let location = Location {
+        start: start_position.clone(),
+        end: end_position.clone(),
+    };
     FunctionReport {
         snapshot_id: String::new(),
         declaration_fingerprint: identity::rust_span_fingerprint(
@@ -899,12 +904,16 @@ fn make_function_report(
         kind,
         category,
         location: Location {
-            start: start_position,
-            end: end_position,
+            start: start_position.clone(),
+            end: end_position.clone(),
         },
         lines,
         tokens: token_count,
-        score: score::score(&metrics),
+        score: score::score_with_contributions(
+            &metrics,
+            location.clone(),
+            score::rust_function_contributions(block, signature, location),
+        ),
         metrics,
     }
 }
@@ -934,6 +943,16 @@ fn make_closure_report(
         },
     );
 
+    let location = Location {
+        start: Position {
+            line: start.line,
+            column: start.column + 1,
+        },
+        end: Position {
+            line: end.line,
+            column: end.column + 1,
+        },
+    };
     FunctionReport {
         snapshot_id: String::new(),
         declaration_fingerprint: identity::lexical_fingerprint(
@@ -962,7 +981,11 @@ fn make_closure_report(
         },
         lines: end.line.saturating_sub(start.line) + 1,
         tokens: token_count,
-        score: score::score(&metrics),
+        score: score::score_with_contributions(
+            &metrics,
+            location.clone(),
+            score::rust_closure_contributions(&closure.body, &closure.inputs, base_depth, location),
+        ),
         metrics,
     }
 }
@@ -983,6 +1006,16 @@ fn make_initializer_report(
     let metrics = score::measure_expression(expression, code_lines, 0, 0);
     let token_count = tokens_in_span(function_source.lexed, item_span);
 
+    let location = Location {
+        start: Position {
+            line: start.line,
+            column: start.column + 1,
+        },
+        end: Position {
+            line: end.line,
+            column: end.column + 1,
+        },
+    };
     FunctionReport {
         snapshot_id: String::new(),
         declaration_fingerprint: identity::lexical_fingerprint(
@@ -1011,7 +1044,11 @@ fn make_initializer_report(
         },
         lines: end.line.saturating_sub(start.line) + 1,
         tokens: token_count,
-        score: score::score(&metrics),
+        score: score::score_with_contributions(
+            &metrics,
+            location.clone(),
+            score::rust_initializer_contributions(expression, location),
+        ),
         metrics,
     }
 }
@@ -1389,9 +1426,10 @@ mod tests {
         };
         let summary = summarize(std::slice::from_ref(&file));
         Report {
+            report_kind: "analysis".to_owned(),
+            schema_version: crate::model::SCHEMA_VERSION,
             tool: "kompass".to_owned(),
             version: "0.1.0".to_owned(),
-            schema_version: identity::REPORT_SCHEMA_VERSION.to_owned(),
             evidence_version: identity::EVIDENCE_VERSION.to_owned(),
             model: SCORE_MODEL.to_owned(),
             analysis_contract: AnalysisContract::current(),
