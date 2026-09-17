@@ -23,7 +23,7 @@ Agent workflow:
   3. Compare the reports safely:
        kompass diff before.json after.json
      The command checks model, analysis contract, root, file scope, and coverage before showing
-     burden, p95, highest-callable, per-file, and possible-redistribution deltas.
+     burden, p95, highest-callable, per-file, per-language, and callable identity deltas.
 
 For custom automation, `summary.burden.production` is the production burden in
 integer tenths (143 means 14.3). Inspect `files[].burden`,
@@ -34,7 +34,7 @@ and callable detail. `summary.languages` counts Rust and Python files, while
 JSON is the agent interface: it includes every analyzed callable and initializer. `--top`,
 `--sort`, `--tests`, and `--all` affect text output only. Production and test
 categories use the same score but remain scored and summarized separately.
-Only compare reports whose top-level `model` and `analysis_contract` values match.
+Only compare reports whose top-level `model` and `analysis_contract` values match; schema and evidence values must also be current.
 Check `coverage.complete` and `errors`; status 0 means the report completed
 without analysis errors, while status 2 means the input, analysis, or output
 failed. Status 2 can still emit a partial JSON report, so a lower burden is
@@ -65,9 +65,17 @@ reported as file errors so coverage cannot appear complete.
 Compare complete reports with:
      kompass diff BEFORE.json AFTER.json
 The diff command requires the same root, score model, analysis contract, file
-scope, and complete coverage. Pass `--allow-file-changes` only when added or removed files are part
-of the intended comparison; the output then highlights those files and warns
-that aggregate deltas include their burden.
+scope, and complete coverage. Pass --allow-root-change for equivalent checkouts
+or worktrees with different absolute roots; relative file paths, language,
+schema, evidence, and coverage checks remain enforced. Pass --allow-file-changes
+only when added or removed files are part of the intended comparison; the output
+then highlights those files and warns that aggregate deltas include their burden.
+Every callable has a snapshot id and declaration/body lexical fingerprints.
+Diff matching proceeds through unique snapshot, declaration/body, body,
+declaration, and qualified-name evidence. Ambiguous evidence remains unmatched
+and is reported as a warning; ordinal or score-based matching is never used.
+Moved callables appear in the functions.moved collection, while language_deltas
+partitions burden and score components by language.
 The comparison also shows production and test callable-count, p95, and highest
 score changes, per-file burden deltas, and conservative possible-redistribution
 signals. A redistribution signal proves no call or extraction relationship.
@@ -129,6 +137,10 @@ struct DiffArgs {
     /// Allow added or removed files, with an explicit scope warning.
     #[arg(long)]
     allow_file_changes: bool,
+
+    /// Allow different absolute report roots while keeping relative scope checks.
+    #[arg(long)]
+    allow_root_change: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -189,6 +201,7 @@ fn main() {
             &args.after,
             diff::CompareOptions {
                 allow_file_changes: args.allow_file_changes,
+                allow_root_change: args.allow_root_change,
             },
         ) {
             Ok(comparison) => comparison,

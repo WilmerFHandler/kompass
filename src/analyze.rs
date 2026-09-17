@@ -8,6 +8,7 @@ use syn::visit::{self, Visit};
 use syn::{Attribute, FnArg, ItemConst, ItemFn, ItemMod, ItemStatic, Meta, Token};
 
 use crate::discover::{DiscoveredFile, Discovery};
+use crate::identity;
 use crate::model::{
     AnalysisContract, AnalysisError, Burden, Category, CategorySummary, Coverage, ErrorKind,
     FileAnalysis, FileReport, FunctionKind, FunctionReport, Language, LineCounts, Location,
@@ -111,6 +112,8 @@ pub fn analyze_with_frontends(
                 continue;
             }
         };
+        let mut file_analysis = file_analysis;
+        identity::assign_snapshot_ids(&display_path, language, &mut file_analysis.functions);
         let burden = summarize_burden(&file_analysis.functions);
         files.push(FileReport {
             path: display_path,
@@ -150,6 +153,8 @@ pub fn analyze_with_frontends(
     Report {
         tool: "kompass".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        schema_version: identity::REPORT_SCHEMA_VERSION.to_owned(),
+        evidence_version: identity::EVIDENCE_VERSION.to_owned(),
         model: SCORE_MODEL.to_owned(),
         analysis_contract: AnalysisContract::current(),
         root: root.to_string_lossy().into_owned(),
@@ -173,7 +178,7 @@ fn analyze_rust_file(source: &str, file_is_test: bool) -> Result<FileAnalysis, A
         kind: ErrorKind::Lex,
         message: error,
     })?;
-    let collected = collect_functions(&syntax, &lexed, &line_analysis, file_is_test);
+    let collected = collect_functions(source, &syntax, &lexed, &line_analysis, file_is_test);
     Ok(FileAnalysis {
         lines: line_analysis.counts,
         tokens: lexed.total_tokens(),
@@ -532,6 +537,7 @@ struct Collection {
 }
 
 fn collect_functions(
+    source: &str,
     syntax: &syn::File,
     lexed: &LexedSource,
     line_analysis: &LineAnalysis,
@@ -542,6 +548,7 @@ fn collect_functions(
         .map(|closure| ((closure.start, closure.end), closure.depth))
         .collect();
     let mut collector = FunctionCollector {
+        source,
         lexed,
         line_analysis,
         test_context: file_is_test,
@@ -557,6 +564,7 @@ fn collect_functions(
 }
 
 struct FunctionCollector<'a> {
+    source: &'a str,
     lexed: &'a LexedSource,
     line_analysis: &'a LineAnalysis,
     test_context: bool,
@@ -580,6 +588,7 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
             &node.expr,
             node.span(),
             FunctionSource {
+                source: self.source,
                 lexed: self.lexed,
                 line_analysis: self.line_analysis,
             },
@@ -600,6 +609,7 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
             &node.expr,
             node.span(),
             FunctionSource {
+                source: self.source,
                 lexed: self.lexed,
                 line_analysis: self.line_analysis,
             },
@@ -620,6 +630,7 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
             &node.expr,
             node.span(),
             FunctionSource {
+                source: self.source,
                 lexed: self.lexed,
                 line_analysis: self.line_analysis,
             },
@@ -641,6 +652,7 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
                 expression,
                 node.span(),
                 FunctionSource {
+                    source: self.source,
                     lexed: self.lexed,
                     line_analysis: self.line_analysis,
                 },
@@ -669,6 +681,7 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
             &node.block,
             inherited_or_public_span(&node.vis, node.sig.span()),
             FunctionSource {
+                source: self.source,
                 lexed: self.lexed,
                 line_analysis: self.line_analysis,
             },
@@ -730,6 +743,7 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
             &node.block,
             inherited_or_public_span(&node.vis, node.sig.span()),
             FunctionSource {
+                source: self.source,
                 lexed: self.lexed,
                 line_analysis: self.line_analysis,
             },
@@ -761,6 +775,7 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
                 block,
                 node.sig.span(),
                 FunctionSource {
+                    source: self.source,
                     lexed: self.lexed,
                     line_analysis: self.line_analysis,
                 },
@@ -800,6 +815,7 @@ impl<'ast> Visit<'ast> for FunctionCollector<'_> {
                 .copied()
                 .unwrap_or(0),
             FunctionSource {
+                source: self.source,
                 lexed: self.lexed,
                 line_analysis: self.line_analysis,
             },
@@ -824,6 +840,7 @@ impl FunctionCollector<'_> {
 
 #[derive(Clone, Copy)]
 struct FunctionSource<'a> {
+    source: &'a str,
     lexed: &'a LexedSource,
     line_analysis: &'a LineAnalysis,
 }
@@ -867,6 +884,17 @@ fn make_function_report(
     );
 
     FunctionReport {
+        snapshot_id: String::new(),
+        declaration_fingerprint: identity::rust_span_fingerprint(
+            function_source.source,
+            start_span,
+            Language::Rust,
+        ),
+        body_fingerprint: identity::rust_span_fingerprint(
+            function_source.source,
+            block.span(),
+            Language::Rust,
+        ),
         name,
         kind,
         category,
@@ -907,6 +935,18 @@ fn make_closure_report(
     );
 
     FunctionReport {
+        snapshot_id: String::new(),
+        declaration_fingerprint: identity::lexical_fingerprint(
+            function_source.source,
+            identity::rust_offset(function_source.source, start),
+            identity::rust_offset(function_source.source, closure.body.span().start()),
+            Language::Rust,
+        ),
+        body_fingerprint: identity::rust_span_fingerprint(
+            function_source.source,
+            closure.body.span(),
+            Language::Rust,
+        ),
         name,
         kind: FunctionKind::Closure,
         category,
@@ -944,6 +984,18 @@ fn make_initializer_report(
     let token_count = tokens_in_span(function_source.lexed, item_span);
 
     FunctionReport {
+        snapshot_id: String::new(),
+        declaration_fingerprint: identity::lexical_fingerprint(
+            function_source.source,
+            identity::rust_offset(function_source.source, start),
+            identity::rust_offset(function_source.source, expression.span().start()),
+            Language::Rust,
+        ),
+        body_fingerprint: identity::rust_span_fingerprint(
+            function_source.source,
+            expression.span(),
+            Language::Rust,
+        ),
         name,
         kind,
         category,
@@ -1325,7 +1377,7 @@ mod tests {
         let lexed = tokens::lex(source).unwrap();
         let syntax = syn::parse_file(source).unwrap();
         let line_analysis = classify_lines(source);
-        let collection = collect_functions(&syntax, &lexed, &line_analysis, false);
+        let collection = collect_functions(source, &syntax, &lexed, &line_analysis, false);
         let file = FileReport {
             path: "src/lib.rs".to_owned(),
             language: Language::Rust,
@@ -1339,6 +1391,8 @@ mod tests {
         Report {
             tool: "kompass".to_owned(),
             version: "0.1.0".to_owned(),
+            schema_version: identity::REPORT_SCHEMA_VERSION.to_owned(),
+            evidence_version: identity::EVIDENCE_VERSION.to_owned(),
             model: SCORE_MODEL.to_owned(),
             analysis_contract: AnalysisContract::current(),
             root: "/tmp".to_owned(),
@@ -1421,7 +1475,7 @@ mod tests {
         let lexed = tokens::lex(source).unwrap();
         let syntax = syn::parse_file(source).unwrap();
         let line_analysis = classify_lines(source);
-        let collection = collect_functions(&syntax, &lexed, &line_analysis, false);
+        let collection = collect_functions(source, &syntax, &lexed, &line_analysis, false);
         assert_eq!(collection.functions.len(), 8);
         assert_eq!(
             collection
@@ -1432,7 +1486,7 @@ mod tests {
             5
         );
 
-        let integration = collect_functions(&syntax, &lexed, &line_analysis, true);
+        let integration = collect_functions(source, &syntax, &lexed, &line_analysis, true);
         assert!(
             integration
                 .functions
@@ -1455,7 +1509,7 @@ mod tests {
         let lexed = tokens::lex(source).unwrap();
         let syntax = syn::parse_file(source).unwrap();
         let line_analysis = classify_lines(source);
-        let collection = collect_functions(&syntax, &lexed, &line_analysis, false);
+        let collection = collect_functions(source, &syntax, &lexed, &line_analysis, false);
         let closure = collection
             .functions
             .iter()
@@ -1500,7 +1554,7 @@ mod tests {
         let lexed = tokens::lex(source).unwrap();
         let syntax = syn::parse_file(source).unwrap();
         let line_analysis = classify_lines(source);
-        let collection = collect_functions(&syntax, &lexed, &line_analysis, false);
+        let collection = collect_functions(source, &syntax, &lexed, &line_analysis, false);
 
         assert_eq!(collection.functions.len(), 6);
         let initializer = |name: &str, kind: FunctionKind| {
@@ -1563,7 +1617,7 @@ mod tests {
         let lexed = tokens::lex(source).unwrap();
         let syntax = syn::parse_file(source).unwrap();
         let line_analysis = classify_lines(source);
-        let collection = collect_functions(&syntax, &lexed, &line_analysis, false);
+        let collection = collect_functions(source, &syntax, &lexed, &line_analysis, false);
         let parent = collection
             .functions
             .iter()
@@ -1829,7 +1883,7 @@ mod tests {
         let lexed = tokens::lex(source).unwrap();
         let syntax = syn::parse_file(source).unwrap();
         let line_analysis = classify_lines(source);
-        let collection = collect_functions(&syntax, &lexed, &line_analysis, false);
+        let collection = collect_functions(source, &syntax, &lexed, &line_analysis, false);
         let outer = collection
             .functions
             .iter()

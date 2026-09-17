@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::identity;
 use crate::model::{AnalysisContract, OutputFormat};
 
 const COMPONENT_NAMES: [&str; 8] = [
@@ -31,6 +32,10 @@ pub struct CompareOptions {
     /// Permit the before and after reports to contain different files.
     /// Aggregate deltas then include the burden of added and removed files.
     pub allow_file_changes: bool,
+    /// Permit reports captured from equivalent roots such as a worktree and
+    /// its checkout. Relative file paths and all other identity checks remain
+    /// strict.
+    pub allow_root_change: bool,
 }
 
 /// Compare two complete JSON reports with the default strict file scope.
@@ -73,6 +78,9 @@ pub struct Comparison {
     pub scope: ScopeSummary,
     pub file_changes: FileChanges,
     pub file_burdens: Vec<FileBurdenDelta>,
+    /// Burden and score-component deltas partitioned by source language. The
+    /// burden and component totals reconcile with the repository deltas.
+    pub language_deltas: Vec<LanguageDelta>,
     pub burden: BurdenDelta,
     pub callables: CallableStatsDelta,
     pub macro_opacity: MacroOpacityDelta,
@@ -89,6 +97,8 @@ pub struct ReportMetadata {
     pub path: String,
     pub root: String,
     pub version: String,
+    pub schema_version: String,
+    pub evidence_version: String,
     pub model: String,
     pub analysis_contract: AnalysisContract,
 }
@@ -117,6 +127,15 @@ pub struct FileBurdenDelta {
     pub production: MetricDelta,
     pub test: MetricDelta,
     pub total: MetricDelta,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LanguageDelta {
+    pub language: String,
+    pub files: MetricDelta,
+    pub burden: BurdenDelta,
+    pub callables: CallableStatsDelta,
+    pub components: Vec<ComponentDelta>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -167,6 +186,7 @@ pub struct FunctionChanges {
     pub changed: Vec<FunctionChange>,
     pub added: Vec<FunctionChange>,
     pub removed: Vec<FunctionChange>,
+    pub moved: Vec<FunctionChange>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -175,11 +195,20 @@ pub enum ChangeStatus {
     Changed,
     Added,
     Removed,
+    Moved,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct FunctionChange {
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_name: Option<String>,
     pub name: String,
     pub kind: String,
     pub category: String,
@@ -187,6 +216,9 @@ pub struct FunctionChange {
     pub before_score: Option<usize>,
     pub after_score: Option<usize>,
     pub delta: i64,
+    /// Evidence stage that paired the two units, or `unmatched` for an add or
+    /// removal.
+    pub match_basis: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -278,9 +310,9 @@ fn compare_reports(
             after.analysis_contract.display()
         ));
     }
-    if before.root != after.root {
+    if before.root != after.root && !options.allow_root_change {
         issues.push(format!(
-            "analyzed roots differ: before is {:?}, after is {:?}; use the same input root",
+            "analyzed roots differ: before is {:?}, after is {:?}; use the same input root or pass --allow-root-change",
             before.root, after.root
         ));
     }
@@ -327,6 +359,12 @@ fn compare_reports(
                 .to_owned(),
         );
     }
+    if before.root != after.root {
+        warnings.push(
+            "analyzed roots differ; relative file paths are compared after explicit root override"
+                .to_owned(),
+        );
+    }
     if before.version != after.version {
         warnings.push(format!(
             "report versions differ: {} before, {} after; the score model still matches",
@@ -342,7 +380,7 @@ fn compare_reports(
 
     let before_functions = function_map("before", &before_files)?;
     let after_functions = function_map("after", &after_files)?;
-    let (functions, component_before, component_after) =
+    let (functions, component_before, component_after, mut match_warnings) =
         compare_functions(&before_functions, &after_functions);
     let components = component_deltas(component_before, component_after);
     let file_burdens = file_burden_deltas(&before_files, &after_files);
@@ -353,6 +391,13 @@ fn compare_reports(
         &before_files,
         &after_files,
     );
+    let language_deltas = language_deltas(
+        &before_files,
+        &after_files,
+        &before_functions,
+        &after_functions,
+    );
+    warnings.append(&mut match_warnings);
 
     Ok(Comparison {
         comparable: true,
@@ -370,6 +415,7 @@ fn compare_reports(
         },
         file_changes,
         file_burdens,
+        language_deltas,
         burden: BurdenDelta {
             production: metric_delta(
                 before.summary.burden.production,
@@ -416,6 +462,20 @@ fn validate_identity(label: &str, report: &InputReport, issues: &mut Vec<String>
     }
     if report.root.trim().is_empty() {
         issues.push(format!("{label} report has an empty analyzed root"));
+    }
+    if report.schema_version != identity::REPORT_SCHEMA_VERSION {
+        issues.push(format!(
+            "{label} report has schema {:?}; expected {}; compact or non-analysis reports cannot be used as baselines",
+            report.schema_version,
+            identity::REPORT_SCHEMA_VERSION
+        ));
+    }
+    if report.evidence_version != identity::EVIDENCE_VERSION {
+        issues.push(format!(
+            "{label} report has evidence version {:?}; expected {}; regenerate a complete analysis report",
+            report.evidence_version,
+            identity::EVIDENCE_VERSION
+        ));
     }
     if !report.analysis_contract.is_complete() {
         issues.push(format!(
@@ -465,6 +525,7 @@ fn file_map<'a>(
     issues: &mut Vec<String>,
 ) -> BTreeMap<String, &'a InputFile> {
     let mut files = BTreeMap::new();
+    let mut snapshot_ids = BTreeSet::new();
     for file in &report.files {
         if file.language.trim().is_empty() {
             issues.push(format!(
@@ -478,6 +539,27 @@ fn file_map<'a>(
                 file.path
             ));
         }
+        for function in &file.functions {
+            if function.snapshot_id.trim().is_empty() {
+                issues.push(format!(
+                    "{label} report has no snapshot id for {:?} in {:?}; compact or legacy unit records cannot be compared",
+                    function.name, file.path
+                ));
+            } else if !snapshot_ids.insert(function.snapshot_id.clone()) {
+                issues.push(format!(
+                    "{label} report reuses snapshot id {:?}; regenerate the complete analysis report",
+                    function.snapshot_id
+                ));
+            }
+            if function.declaration_fingerprint.trim().is_empty()
+                || function.body_fingerprint.trim().is_empty()
+            {
+                issues.push(format!(
+                    "{label} report has incomplete lexical evidence for {:?} in {:?}; compact or legacy unit records cannot be compared",
+                    function.name, file.path
+                ));
+            }
+        }
     }
     files
 }
@@ -488,12 +570,12 @@ fn function_map<'a>(
 ) -> Result<BTreeMap<FunctionKey, &'a InputFunction>, DiffError> {
     let mut functions = BTreeMap::new();
     for (path, file) in files {
-        let mut closure_names = BTreeMap::new();
-        let mut next_closure = BTreeMap::new();
         for function in &file.functions {
             let key = FunctionKey {
                 path: path.clone(),
-                name: stable_callable_name(&function.name, &mut closure_names, &mut next_closure),
+                language: file.language.clone(),
+                snapshot_id: function.snapshot_id.clone(),
+                name: function.name.clone(),
                 kind: function.kind.clone(),
                 category: function.category.clone(),
             };
@@ -514,93 +596,236 @@ fn function_map<'a>(
 /// Analyzer reports identify closures with source locations. Comparisons use
 /// their order within each lexical parent instead, so unrelated line shifts do
 /// not turn every closure into a removed-and-added pair.
-fn stable_callable_name(
-    name: &str,
-    closure_names: &mut BTreeMap<String, String>,
-    next_closure: &mut BTreeMap<String, usize>,
-) -> String {
-    let mut raw_prefix = String::new();
-    let mut stable_prefix = String::new();
-    for segment in name.split("::") {
-        push_name_segment(&mut raw_prefix, segment);
-        let located_kind = if segment.starts_with("<closure@") && segment.ends_with('>') {
-            Some("closure")
-        } else if segment.starts_with("<lambda@") && segment.ends_with('>') {
-            Some("lambda")
-        } else {
-            None
-        };
-        if let Some(kind) = located_kind {
-            let stable_name = closure_names.entry(raw_prefix.clone()).or_insert_with(|| {
-                let ordinal = next_closure.entry(stable_prefix.clone()).or_default();
-                *ordinal = ordinal.saturating_add(1);
-                let mut generated = stable_prefix.clone();
-                push_name_segment(&mut generated, &format!("<{kind}#{}>", *ordinal));
-                generated
-            });
-            stable_prefix.clone_from(stable_name);
-        } else {
-            push_name_segment(&mut stable_prefix, segment);
-        }
-    }
-    stable_prefix
-}
-
-fn push_name_segment(name: &mut String, segment: &str) {
-    if !name.is_empty() {
-        name.push_str("::");
-    }
-    name.push_str(segment);
-}
-
 fn compare_functions(
     before: &BTreeMap<FunctionKey, &InputFunction>,
     after: &BTreeMap<FunctionKey, &InputFunction>,
-) -> (FunctionChanges, [usize; 8], [usize; 8]) {
+) -> (FunctionChanges, [usize; 8], [usize; 8], Vec<String>) {
     let mut changes = FunctionChanges::default();
     let mut component_before = [0usize; 8];
     let mut component_after = [0usize; 8];
 
-    for (key, before_function) in before {
+    for before_function in before.values() {
         add_components(&mut component_before, &before_function.score);
-        match after.get(key) {
-            Some(after_function) => {
-                add_components(&mut component_after, &after_function.score);
-                if function_changed(before_function, after_function) {
-                    changes.changed.push(function_change(
-                        key,
-                        ChangeStatus::Changed,
-                        Some(before_function.score.value),
-                        Some(after_function.score.value),
-                    ));
-                }
-            }
-            None => {
-                changes.removed.push(function_change(
-                    key,
-                    ChangeStatus::Removed,
-                    Some(before_function.score.value),
-                    None,
-                ));
-            }
-        }
     }
-    for (key, after_function) in after {
-        if !before.contains_key(key) {
-            add_components(&mut component_after, &after_function.score);
-            changes.added.push(function_change(
-                key,
-                ChangeStatus::Added,
-                None,
-                Some(after_function.score.value),
+    for after_function in after.values() {
+        add_components(&mut component_after, &after_function.score);
+    }
+
+    let (matches, unmatched_before, unmatched_after, warnings) = staged_matches(before, after);
+    for (before_key, after_key, basis) in matches {
+        let before_function = before[&before_key];
+        let after_function = after[&after_key];
+        let moved = before_key.path != after_key.path;
+        if moved {
+            changes.moved.push(matched_function_change(
+                &before_key,
+                &after_key,
+                before_function,
+                after_function,
+                ChangeStatus::Moved,
+                basis,
+            ));
+        } else if function_changed(before_function, after_function) {
+            changes.changed.push(matched_function_change(
+                &before_key,
+                &after_key,
+                before_function,
+                after_function,
+                ChangeStatus::Changed,
+                basis,
             ));
         }
+    }
+    for key in unmatched_before {
+        let function = before[&key];
+        changes.removed.push(function_change(
+            &key,
+            ChangeStatus::Removed,
+            Some(function.score.value),
+            None,
+        ));
+    }
+    for key in unmatched_after {
+        let function = after[&key];
+        changes.added.push(function_change(
+            &key,
+            ChangeStatus::Added,
+            None,
+            Some(function.score.value),
+        ));
     }
 
     sort_function_changes(&mut changes.changed);
     sort_function_changes(&mut changes.added);
     sort_function_changes(&mut changes.removed);
-    (changes, component_before, component_after)
+    sort_function_changes(&mut changes.moved);
+    (changes, component_before, component_after, warnings)
+}
+
+type FunctionMatches = (
+    Vec<(FunctionKey, FunctionKey, MatchBasis)>,
+    Vec<FunctionKey>,
+    Vec<FunctionKey>,
+    Vec<String>,
+);
+
+#[derive(Clone, Copy, Debug)]
+enum MatchBasis {
+    SnapshotId,
+    DeclarationAndBody,
+    BodyFingerprint,
+    DeclarationFingerprint,
+    QualifiedName,
+}
+
+impl MatchBasis {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SnapshotId => "snapshot_id",
+            Self::DeclarationAndBody => "declaration_and_body",
+            Self::BodyFingerprint => "body_fingerprint",
+            Self::DeclarationFingerprint => "declaration_fingerprint",
+            Self::QualifiedName => "qualified_name",
+        }
+    }
+}
+
+fn staged_matches(
+    before: &BTreeMap<FunctionKey, &InputFunction>,
+    after: &BTreeMap<FunctionKey, &InputFunction>,
+) -> FunctionMatches {
+    let mut remaining_before = before.keys().cloned().collect::<BTreeSet<_>>();
+    let mut remaining_after = after.keys().cloned().collect::<BTreeSet<_>>();
+    let mut matches = Vec::new();
+    let mut warnings = Vec::new();
+
+    match_unique_stage(
+        MatchBasis::SnapshotId,
+        before,
+        after,
+        &mut remaining_before,
+        &mut remaining_after,
+        &mut matches,
+        &mut warnings,
+        |_, function| function.snapshot_id.clone(),
+    );
+    match_unique_stage(
+        MatchBasis::DeclarationAndBody,
+        before,
+        after,
+        &mut remaining_before,
+        &mut remaining_after,
+        &mut matches,
+        &mut warnings,
+        |_, function| {
+            format!(
+                "{}\u{1f}{}",
+                function.declaration_fingerprint, function.body_fingerprint
+            )
+        },
+    );
+    match_unique_stage(
+        MatchBasis::BodyFingerprint,
+        before,
+        after,
+        &mut remaining_before,
+        &mut remaining_after,
+        &mut matches,
+        &mut warnings,
+        |_, function| function.body_fingerprint.clone(),
+    );
+    match_unique_stage(
+        MatchBasis::DeclarationFingerprint,
+        before,
+        after,
+        &mut remaining_before,
+        &mut remaining_after,
+        &mut matches,
+        &mut warnings,
+        |_, function| function.declaration_fingerprint.clone(),
+    );
+    match_unique_stage(
+        MatchBasis::QualifiedName,
+        before,
+        after,
+        &mut remaining_before,
+        &mut remaining_after,
+        &mut matches,
+        &mut warnings,
+        |key, _| key.name.clone(),
+    );
+
+    (
+        matches,
+        remaining_before.into_iter().collect(),
+        remaining_after.into_iter().collect(),
+        warnings,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn match_unique_stage<F>(
+    basis: MatchBasis,
+    before: &BTreeMap<FunctionKey, &InputFunction>,
+    after: &BTreeMap<FunctionKey, &InputFunction>,
+    remaining_before: &mut BTreeSet<FunctionKey>,
+    remaining_after: &mut BTreeSet<FunctionKey>,
+    matches: &mut Vec<(FunctionKey, FunctionKey, MatchBasis)>,
+    warnings: &mut Vec<String>,
+    selector: F,
+) where
+    F: Fn(&FunctionKey, &InputFunction) -> String,
+{
+    let mut before_groups = BTreeMap::<String, Vec<FunctionKey>>::new();
+    let mut after_groups = BTreeMap::<String, Vec<FunctionKey>>::new();
+    for key in remaining_before.iter() {
+        let function = before[key];
+        before_groups
+            .entry(evidence_group_key(key, &selector(key, function)))
+            .or_default()
+            .push(key.clone());
+    }
+    for key in remaining_after.iter() {
+        let function = after[key];
+        after_groups
+            .entry(evidence_group_key(key, &selector(key, function)))
+            .or_default()
+            .push(key.clone());
+    }
+
+    let groups = before_groups
+        .keys()
+        .chain(after_groups.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for group in groups {
+        let before_candidates = before_groups.get(&group).cloned().unwrap_or_default();
+        let after_candidates = after_groups.get(&group).cloned().unwrap_or_default();
+        if before_candidates.len() == 1 && after_candidates.len() == 1 {
+            let before_key = before_candidates[0].clone();
+            let after_key = after_candidates[0].clone();
+            remaining_before.remove(&before_key);
+            remaining_after.remove(&after_key);
+            matches.push((before_key, after_key, basis));
+        } else if !before_candidates.is_empty()
+            && !after_candidates.is_empty()
+            && (before_candidates.len() > 1 || after_candidates.len() > 1)
+        {
+            warnings.push(format!(
+                "ambiguous {} match for {} before unit(s) and {} after unit(s); units remain unmatched",
+                basis.label(),
+                before_candidates.len(),
+                after_candidates.len()
+            ));
+        }
+    }
+}
+
+fn evidence_group_key(key: &FunctionKey, evidence: &str) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        key.language, key.kind, key.category, evidence
+    )
 }
 
 fn file_burden_deltas(
@@ -663,6 +888,84 @@ fn callable_stats(
             after_scores.iter().copied().max().unwrap_or(0),
         ),
     }
+}
+
+fn language_deltas(
+    before_files: &BTreeMap<String, &InputFile>,
+    after_files: &BTreeMap<String, &InputFile>,
+    before_functions: &BTreeMap<FunctionKey, &InputFunction>,
+    after_functions: &BTreeMap<FunctionKey, &InputFunction>,
+) -> Vec<LanguageDelta> {
+    let languages = before_files
+        .values()
+        .chain(after_files.values())
+        .map(|file| file.language.clone())
+        .collect::<BTreeSet<_>>();
+    languages
+        .into_iter()
+        .map(|language| {
+            let before_language_functions = functions_for_language(before_functions, &language);
+            let after_language_functions = functions_for_language(after_functions, &language);
+            let mut component_before = [0usize; 8];
+            let mut component_after = [0usize; 8];
+            for function in before_language_functions.values() {
+                add_components(&mut component_before, &function.score);
+            }
+            for function in after_language_functions.values() {
+                add_components(&mut component_after, &function.score);
+            }
+            let before_burden = file_burden_for_language(before_files, &language);
+            let after_burden = file_burden_for_language(after_files, &language);
+            LanguageDelta {
+                language: language.clone(),
+                files: metric_delta(
+                    before_files
+                        .values()
+                        .filter(|file| file.language == language)
+                        .count(),
+                    after_files
+                        .values()
+                        .filter(|file| file.language == language)
+                        .count(),
+                ),
+                burden: BurdenDelta {
+                    production: metric_delta(before_burden.production, after_burden.production),
+                    test: metric_delta(before_burden.test, after_burden.test),
+                    total: metric_delta(before_burden.total, after_burden.total),
+                },
+                callables: callable_stats_delta(
+                    &before_language_functions,
+                    &after_language_functions,
+                ),
+                components: component_deltas(component_before, component_after),
+            }
+        })
+        .collect()
+}
+
+fn functions_for_language<'a>(
+    functions: &BTreeMap<FunctionKey, &'a InputFunction>,
+    language: &str,
+) -> BTreeMap<FunctionKey, &'a InputFunction> {
+    functions
+        .iter()
+        .filter(|(key, _)| key.language == language)
+        .map(|(key, function)| (key.clone(), *function))
+        .collect()
+}
+
+fn file_burden_for_language(files: &BTreeMap<String, &InputFile>, language: &str) -> InputBurden {
+    let mut burden = InputBurden {
+        production: 0,
+        test: 0,
+        total: 0,
+    };
+    for file in files.values().filter(|file| file.language == language) {
+        burden.production = burden.production.saturating_add(file.burden.production);
+        burden.test = burden.test.saturating_add(file.burden.test);
+        burden.total = burden.total.saturating_add(file.burden.total);
+    }
+    burden
 }
 
 fn scores_for_category(
@@ -801,7 +1104,33 @@ fn category_file_burden(file: &InputFile, category: &str) -> usize {
 }
 
 fn function_changed(before: &InputFunction, after: &InputFunction) -> bool {
-    before.score != after.score || before.metrics != after.metrics
+    before.score != after.score
+        || before.metrics != after.metrics
+        || canonical_unit_name(&before.name) != canonical_unit_name(&after.name)
+        || before.kind != after.kind
+        || before.category != after.category
+        || before.declaration_fingerprint != after.declaration_fingerprint
+        || before.body_fingerprint != after.body_fingerprint
+}
+
+fn canonical_unit_name(name: &str) -> String {
+    name.split("::")
+        .map(|segment| {
+            if (segment.starts_with("<closure@") || segment.starts_with("<lambda@"))
+                && segment.ends_with('>')
+            {
+                let kind = if segment.starts_with("<closure@") {
+                    "closure"
+                } else {
+                    "lambda"
+                };
+                format!("<{kind}>")
+            } else {
+                segment.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("::")
 }
 
 fn function_change(
@@ -812,6 +1141,10 @@ fn function_change(
 ) -> FunctionChange {
     FunctionChange {
         path: key.path.clone(),
+        before_path: matches!(&status, ChangeStatus::Removed).then_some(key.path.clone()),
+        after_path: matches!(&status, ChangeStatus::Added).then_some(key.path.clone()),
+        before_name: matches!(&status, ChangeStatus::Removed).then_some(key.name.clone()),
+        after_name: matches!(&status, ChangeStatus::Added).then_some(key.name.clone()),
         name: key.name.clone(),
         kind: key.kind.clone(),
         category: key.category.clone(),
@@ -819,6 +1152,32 @@ fn function_change(
         before_score,
         after_score,
         delta: optional_delta(before_score, after_score),
+        match_basis: "unmatched".to_owned(),
+    }
+}
+
+fn matched_function_change(
+    before_key: &FunctionKey,
+    after_key: &FunctionKey,
+    before: &InputFunction,
+    after: &InputFunction,
+    status: ChangeStatus,
+    basis: MatchBasis,
+) -> FunctionChange {
+    FunctionChange {
+        path: after_key.path.clone(),
+        before_path: Some(before_key.path.clone()),
+        after_path: Some(after_key.path.clone()),
+        before_name: Some(before.name.clone()),
+        after_name: Some(after.name.clone()),
+        name: after.name.clone(),
+        kind: after.kind.clone(),
+        category: after.category.clone(),
+        status,
+        before_score: Some(before.score.value),
+        after_score: Some(after.score.value),
+        delta: optional_delta(Some(before.score.value), Some(after.score.value)),
+        match_basis: basis.label().to_owned(),
     }
 }
 
@@ -880,6 +1239,8 @@ fn metadata(path: &Path, report: &InputReport) -> ReportMetadata {
         path: path.to_string_lossy().into_owned(),
         root: report.root.clone(),
         version: report.version.clone(),
+        schema_version: report.schema_version.clone(),
+        evidence_version: report.evidence_version.clone(),
         model: report.model.clone(),
         analysis_contract: report.analysis_contract.clone(),
     }
@@ -940,6 +1301,12 @@ fn render_text(comparison: &Comparison) -> String {
         comparison.before.analysis_contract.display()
     )
     .unwrap();
+    writeln!(
+        output,
+        "Evidence · schema {} · {}",
+        comparison.before.schema_version, comparison.before.evidence_version
+    )
+    .unwrap();
     if comparison.scope.file_set_changed {
         writeln!(
             output,
@@ -981,6 +1348,7 @@ fn render_text(comparison: &Comparison) -> String {
     writeln!(output, "Callable summary deltas").unwrap();
     render_callable_stats(&mut output, "Production", &comparison.callables.production);
     render_callable_stats(&mut output, "Tests", &comparison.callables.test);
+    render_language_deltas(&mut output, &comparison.language_deltas);
 
     render_file_burdens(&mut output, &comparison.file_burdens);
 
@@ -997,6 +1365,7 @@ fn render_text(comparison: &Comparison) -> String {
         "Removed callables",
         &comparison.functions.removed,
     );
+    render_function_group(&mut output, "Moved callables", &comparison.functions.moved);
 
     if !comparison.possible_redistributions.is_empty() {
         output.push('\n');
@@ -1128,6 +1497,25 @@ fn render_callable_stats(output: &mut String, label: &str, stats: &CallableStats
     .unwrap();
 }
 
+fn render_language_deltas(output: &mut String, deltas: &[LanguageDelta]) {
+    use std::fmt::Write as _;
+    writeln!(output, "Language deltas").unwrap();
+    for delta in deltas {
+        writeln!(
+            output,
+            "{} · files {} → {} ({:+}) · burden {} → {} ({:+.1})",
+            delta.language,
+            delta.files.before,
+            delta.files.after,
+            delta.files.delta,
+            format_score(delta.burden.total.before),
+            format_score(delta.burden.total.after),
+            delta.burden.total.delta as f64 / 10.0,
+        )
+        .unwrap();
+    }
+}
+
 fn render_redistribution(output: &mut String, hint: &RedistributionHint) {
     use std::fmt::Write as _;
     writeln!(
@@ -1185,17 +1573,36 @@ fn render_function_group(output: &mut String, label: &str, changes: &[FunctionCh
             .after_score
             .map(format_score)
             .unwrap_or_else(|| "—".to_owned());
-        writeln!(
-            output,
-            "  {:+6.1}  {} · {} [{}] ({} → {})",
-            change.delta as f64 / 10.0,
-            change.path,
-            change.name,
-            change.category,
-            before,
-            after
-        )
-        .unwrap();
+        if let (Some(before_path), Some(after_path)) = (&change.before_path, &change.after_path)
+            && before_path != after_path
+        {
+            writeln!(
+                output,
+                "  {:+6.1}  {} → {} · {} [{}; {}] ({} → {})",
+                change.delta as f64 / 10.0,
+                before_path,
+                after_path,
+                change.name,
+                change.category,
+                change.match_basis,
+                before,
+                after
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                output,
+                "  {:+6.1}  {} · {} [{}; {}] ({} → {})",
+                change.delta as f64 / 10.0,
+                change.path,
+                change.name,
+                change.category,
+                change.match_basis,
+                before,
+                after
+            )
+            .unwrap();
+        }
     }
 }
 
@@ -1206,6 +1613,8 @@ fn format_score(units: usize) -> String {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FunctionKey {
     path: String,
+    language: String,
+    snapshot_id: String,
     name: String,
     kind: String,
     category: String,
@@ -1217,10 +1626,14 @@ impl FunctionKey {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct InputReport {
     tool: String,
     version: String,
+    #[serde(default)]
+    schema_version: String,
+    #[serde(default)]
+    evidence_version: String,
     model: String,
     #[serde(default)]
     analysis_contract: AnalysisContract,
@@ -1233,19 +1646,19 @@ struct InputReport {
     errors: Vec<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct InputSummary {
     burden: InputBurden,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct InputBurden {
     production: usize,
     test: usize,
     total: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct InputCoverage {
     discovered_files: usize,
     analyzed_files: usize,
@@ -1254,7 +1667,7 @@ struct InputCoverage {
     complete: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct InputMacroOpacity {
     invocations: usize,
     source_tokens: usize,
@@ -1264,7 +1677,7 @@ struct InputMacroOpacity {
     definition_tokens: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct InputFile {
     path: String,
     #[serde(default)]
@@ -1276,8 +1689,14 @@ struct InputFile {
     macro_opacity: InputMacroOpacity,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct InputFunction {
+    #[serde(default)]
+    snapshot_id: String,
+    #[serde(default)]
+    declaration_fingerprint: String,
+    #[serde(default)]
+    body_fingerprint: String,
     name: String,
     kind: String,
     category: String,
@@ -1362,6 +1781,8 @@ mod tests {
         InputReport {
             tool: "kompass".to_owned(),
             version: "0.1.0".to_owned(),
+            schema_version: identity::REPORT_SCHEMA_VERSION.to_owned(),
+            evidence_version: identity::EVIDENCE_VERSION.to_owned(),
             model: "test-model".to_owned(),
             analysis_contract: AnalysisContract {
                 version: "analysis-v1".to_owned(),
@@ -1395,9 +1816,13 @@ mod tests {
     }
 
     fn file(path: &str, functions: Vec<InputFunction>) -> InputFile {
+        file_with_language(path, "rust", functions)
+    }
+
+    fn file_with_language(path: &str, language: &str, functions: Vec<InputFunction>) -> InputFile {
         InputFile {
             path: path.to_owned(),
-            language: "rust".to_owned(),
+            language: language.to_owned(),
             burden: InputBurden {
                 production: functions.iter().map(|f| f.score.value).sum(),
                 test: 0,
@@ -1415,6 +1840,9 @@ mod tests {
 
     fn function(name: &str, value: usize, operations: usize) -> InputFunction {
         InputFunction {
+            snapshot_id: format!("snapshot-{name}-{operations}"),
+            declaration_fingerprint: format!("declaration-{name}-{operations}"),
+            body_fingerprint: format!("body-{name}-{operations}"),
             name: name.to_owned(),
             kind: "function".to_owned(),
             category: "production".to_owned(),
@@ -1434,12 +1862,18 @@ mod tests {
     fn closure(name: &str, value: usize) -> InputFunction {
         let mut function = function(name, value, 0);
         function.kind = "closure".to_owned();
+        function.snapshot_id = format!("closure-{name}");
+        function.declaration_fingerprint = "closure-declaration".to_owned();
+        function.body_fingerprint = "closure-body".to_owned();
         function
     }
 
     fn lambda(name: &str, value: usize) -> InputFunction {
         let mut function = function(name, value, 0);
         function.kind = "lambda".to_owned();
+        function.snapshot_id = format!("lambda-{name}");
+        function.declaration_fingerprint = "lambda-declaration".to_owned();
+        function.body_fingerprint = "lambda-body".to_owned();
         function
     }
 
@@ -1681,6 +2115,7 @@ mod tests {
             after,
             CompareOptions {
                 allow_file_changes: true,
+                allow_root_change: false,
             },
         )
         .unwrap();
@@ -1692,5 +2127,283 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("file set changed"))
         );
+    }
+
+    #[test]
+    fn allows_root_change_only_with_explicit_option() {
+        let before = report(
+            "/checkout",
+            10,
+            vec![file("src/lib.rs", vec![function("run", 10, 0)])],
+            0,
+            0,
+        );
+        let after = report(
+            "/worktree",
+            10,
+            vec![file("src/lib.rs", vec![function("run", 10, 0)])],
+            0,
+            0,
+        );
+        let error = compare_reports(
+            Path::new("before.json"),
+            Path::new("after.json"),
+            before.clone(),
+            after.clone(),
+            CompareOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--allow-root-change"));
+
+        let comparison = compare_reports(
+            Path::new("before.json"),
+            Path::new("after.json"),
+            before,
+            after,
+            CompareOptions {
+                allow_root_change: true,
+                ..CompareOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            comparison
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("roots differ"))
+        );
+    }
+
+    #[test]
+    fn accepts_duplicate_legitimate_names_when_evidence_is_unique() {
+        let before = report(
+            "/repo",
+            20,
+            vec![file(
+                "src/lib.rs",
+                vec![function("property", 10, 1), function("property", 10, 2)],
+            )],
+            0,
+            0,
+        );
+        let after = report(
+            "/repo",
+            20,
+            vec![file(
+                "src/lib.rs",
+                vec![function("property", 10, 1), function("property", 10, 2)],
+            )],
+            0,
+            0,
+        );
+        let comparison = compare_reports(
+            Path::new("before.json"),
+            Path::new("after.json"),
+            before,
+            after,
+            CompareOptions::default(),
+        )
+        .unwrap();
+        assert!(comparison.functions.changed.is_empty());
+        assert!(comparison.functions.added.is_empty());
+        assert!(comparison.functions.removed.is_empty());
+    }
+
+    #[test]
+    fn reports_unique_move_and_rename_with_body_evidence() {
+        let mut moved = function("renamed", 10, 0);
+        moved.body_fingerprint = "shared-body".to_owned();
+        let mut before_function = function("original", 10, 0);
+        before_function.body_fingerprint = "shared-body".to_owned();
+        let before = report(
+            "/repo",
+            10,
+            vec![file("src/old.rs", vec![before_function])],
+            0,
+            0,
+        );
+        let after = report("/repo", 10, vec![file("src/new.rs", vec![moved])], 0, 0);
+        let comparison = compare_reports(
+            Path::new("before.json"),
+            Path::new("after.json"),
+            before,
+            after,
+            CompareOptions {
+                allow_file_changes: true,
+                ..CompareOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(comparison.functions.moved.len(), 1);
+        assert_eq!(
+            comparison.functions.moved[0].match_basis,
+            "body_fingerprint"
+        );
+        assert_eq!(
+            comparison.functions.moved[0].before_path.as_deref(),
+            Some("src/old.rs")
+        );
+        assert_eq!(
+            comparison.functions.moved[0].after_path.as_deref(),
+            Some("src/new.rs")
+        );
+    }
+
+    #[test]
+    fn leaves_ambiguous_body_matches_unpaired() {
+        let mut first = function("first", 10, 0);
+        first.body_fingerprint = "shared-body".to_owned();
+        let mut second = function("second", 10, 0);
+        second.body_fingerprint = "shared-body".to_owned();
+        let mut replacement = function("replacement", 10, 0);
+        replacement.body_fingerprint = "shared-body".to_owned();
+        let before = report(
+            "/repo",
+            20,
+            vec![file("src/lib.rs", vec![first, second])],
+            0,
+            0,
+        );
+        let after = report(
+            "/repo",
+            10,
+            vec![file("src/lib.rs", vec![replacement])],
+            0,
+            0,
+        );
+        let comparison = compare_reports(
+            Path::new("before.json"),
+            Path::new("after.json"),
+            before,
+            after,
+            CompareOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(comparison.functions.removed.len(), 2);
+        assert_eq!(comparison.functions.added.len(), 1);
+        assert!(
+            comparison
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("ambiguous"))
+        );
+    }
+
+    #[test]
+    fn lambda_insertion_does_not_remap_siblings() {
+        let make_lambda = |name: &str, body: &str| {
+            let mut function = lambda(name, 10);
+            function.snapshot_id = format!("snapshot-{name}");
+            function.body_fingerprint = body.to_owned();
+            function.declaration_fingerprint = format!("declaration-{name}");
+            function
+        };
+        let before = report(
+            "/repo",
+            20,
+            vec![file(
+                "module.py",
+                vec![
+                    make_lambda("first", "body-first"),
+                    make_lambda("second", "body-second"),
+                ],
+            )],
+            0,
+            0,
+        );
+        let after = report(
+            "/repo",
+            30,
+            vec![file(
+                "module.py",
+                vec![
+                    make_lambda("inserted", "body-inserted"),
+                    make_lambda("first", "body-first"),
+                    make_lambda("second", "body-second"),
+                ],
+            )],
+            0,
+            0,
+        );
+        let comparison = compare_reports(
+            Path::new("before.json"),
+            Path::new("after.json"),
+            before,
+            after,
+            CompareOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(comparison.functions.added.len(), 1);
+        assert!(comparison.functions.changed.is_empty());
+        assert!(comparison.functions.removed.is_empty());
+    }
+
+    #[test]
+    fn language_deltas_partition_repository_components() {
+        let rust_function = function("rust", 10, 2);
+        let python_function = function("python", 20, 3);
+        let before = report(
+            "/repo",
+            30,
+            vec![
+                file_with_language("src/lib.rs", "rust", vec![rust_function]),
+                file_with_language("src/tool.py", "python", vec![python_function]),
+            ],
+            0,
+            0,
+        );
+        let comparison = compare_reports(
+            Path::new("before.json"),
+            Path::new("after.json"),
+            before.clone(),
+            before,
+            CompareOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(comparison.language_deltas.len(), 2);
+        assert_eq!(
+            comparison
+                .language_deltas
+                .iter()
+                .map(|delta| delta.burden.total.before)
+                .sum::<usize>(),
+            comparison.burden.total.before
+        );
+        assert_eq!(
+            comparison
+                .language_deltas
+                .iter()
+                .flat_map(|delta| delta.components.iter())
+                .filter(|component| component.name == "boundary")
+                .map(|component| component.before)
+                .sum::<usize>(),
+            comparison
+                .components
+                .iter()
+                .find(|component| component.name == "boundary")
+                .map_or(0, |component| component.before)
+        );
+    }
+
+    #[test]
+    fn rejects_reports_without_analysis_evidence() {
+        let mut before = report(
+            "/repo",
+            10,
+            vec![file("src/lib.rs", vec![function("run", 10, 0)])],
+            0,
+            0,
+        );
+        before.schema_version.clear();
+        let after = before.clone();
+        let error = compare_reports(
+            Path::new("before.json"),
+            Path::new("after.json"),
+            before,
+            after,
+            CompareOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("compact or non-analysis"));
     }
 }

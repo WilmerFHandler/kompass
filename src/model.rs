@@ -23,6 +23,10 @@ pub const ANALYSIS_CONTRACT: &str = "analysis-v1";
 pub struct Report {
     pub tool: String,
     pub version: String,
+    /// Version of the serialized report shape.
+    pub schema_version: String,
+    /// Version of the source evidence fields attached to each unit.
+    pub evidence_version: String,
     pub model: String,
     pub analysis_contract: AnalysisContract,
     pub root: String,
@@ -167,6 +171,12 @@ pub struct LineCounts {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct FunctionReport {
+    /// Unique id for this unit in this analyzed snapshot.
+    pub snapshot_id: String,
+    /// Lexical fingerprint of the declaration/signature portion.
+    pub declaration_fingerprint: String,
+    /// Lexical fingerprint of the body/expression portion.
+    pub body_fingerprint: String,
     pub name: String,
     pub kind: FunctionKind,
     pub category: Category,
@@ -223,6 +233,23 @@ pub enum FunctionKind {
     ClassInitializer,
     ConstInitializer,
     StaticInitializer,
+}
+
+impl FunctionKind {
+    pub const fn serialized(&self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Method => "method",
+            Self::TraitMethod => "trait_method",
+            Self::NestedFunction => "nested_function",
+            Self::Closure => "closure",
+            Self::Lambda => "lambda",
+            Self::ModuleInitializer => "module_initializer",
+            Self::ClassInitializer => "class_initializer",
+            Self::ConstInitializer => "const_initializer",
+            Self::StaticInitializer => "static_initializer",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]

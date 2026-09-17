@@ -370,6 +370,8 @@ mod tests {
         let report = Report {
             tool: "kompass".to_owned(),
             version: "0.1.0".to_owned(),
+            schema_version: crate::identity::REPORT_SCHEMA_VERSION.to_owned(),
+            evidence_version: crate::identity::EVIDENCE_VERSION.to_owned(),
             model: SCORE_MODEL.to_owned(),
             analysis_contract: AnalysisContract::current(),
             root: "/tmp/project".to_owned(),
@@ -405,6 +407,9 @@ mod tests {
                 lines: Default::default(),
                 tokens: 12,
                 functions: vec![FunctionReport {
+                    snapshot_id: "test-snapshot".to_owned(),
+                    declaration_fingerprint: "test-declaration".to_owned(),
+                    body_fingerprint: "test-body".to_owned(),
                     name: "run".to_owned(),
                     kind: FunctionKind::Function,
                     category: Category::Production,
@@ -463,6 +468,9 @@ mod tests {
     #[test]
     fn text_rankings_use_the_selected_key_and_deterministic_ties() {
         let function = |name: &str, score: usize, depth: usize, tokens: usize| FunctionReport {
+            snapshot_id: format!("test-{name}"),
+            declaration_fingerprint: format!("declaration-{name}"),
+            body_fingerprint: format!("body-{name}"),
             name: name.to_owned(),
             kind: FunctionKind::Function,
             category: Category::Production,
@@ -485,6 +493,8 @@ mod tests {
         let report = Report {
             tool: "kompass".to_owned(),
             version: "0.1.0".to_owned(),
+            schema_version: crate::identity::REPORT_SCHEMA_VERSION.to_owned(),
+            evidence_version: crate::identity::EVIDENCE_VERSION.to_owned(),
             model: SCORE_MODEL.to_owned(),
             analysis_contract: AnalysisContract::current(),
             root: "/tmp/project".to_owned(),

@@ -17,9 +17,10 @@ use ruff_python_parser::{ParseOptions, parse_unchecked};
 use ruff_source_file::UniversalNewlines;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
+use crate::identity;
 use crate::model::{
-    Category, FileAnalysis, FunctionKind, FunctionReport, LineCounts, Location, MacroOpacity,
-    Metrics, Position,
+    Category, FileAnalysis, FunctionKind, FunctionReport, Language, LineCounts, Location,
+    MacroOpacity, Metrics, Position,
 };
 use crate::score;
 
@@ -272,6 +273,8 @@ impl<'a> UnitCollector<'a> {
                 self.qualified_name("<module>"),
                 FunctionKind::ModuleInitializer,
                 range,
+                range,
+                body_range(&module.body).unwrap_or(range),
                 metrics,
             ));
         }
@@ -307,8 +310,15 @@ impl<'a> UnitCollector<'a> {
         self.scope.push(name.clone());
         let qualified_name = self.qualified_name("");
         self.scope.pop();
-        self.functions
-            .push(self.make_report(qualified_name, kind, range, metrics));
+        let body = body_range(&node.body).unwrap_or(range);
+        self.functions.push(self.make_report(
+            qualified_name,
+            kind,
+            range,
+            declaration_range(range, body),
+            body,
+            metrics,
+        ));
 
         self.collect_function_header(node, depth);
         self.scope.push(name);
@@ -327,6 +337,8 @@ impl<'a> UnitCollector<'a> {
                 qualified_name,
                 FunctionKind::ClassInitializer,
                 range,
+                range,
+                body_range(&node.body).unwrap_or(range),
                 metrics,
             ));
         }
@@ -354,8 +366,15 @@ impl<'a> UnitCollector<'a> {
         self.scope.push(label.clone());
         let qualified_name = self.qualified_name("");
         self.scope.pop();
-        self.functions
-            .push(self.make_report(qualified_name, FunctionKind::Lambda, range, metrics));
+        let body = node.body.range();
+        self.functions.push(self.make_report(
+            qualified_name,
+            FunctionKind::Lambda,
+            range,
+            declaration_range(range, body),
+            body,
+            metrics,
+        ));
 
         if let Some(parameters) = &node.parameters {
             let mut visitor = ChildCollector {
@@ -429,12 +448,27 @@ impl<'a> UnitCollector<'a> {
         name: String,
         kind: FunctionKind,
         range: TextRange,
+        declaration: TextRange,
+        body: TextRange,
         metrics: Metrics,
     ) -> FunctionReport {
         let start = self.line_map.position(range.start());
         let end = self.line_map.end_position(range.end());
         let lines = end.line.saturating_sub(start.line) + 1;
         FunctionReport {
+            snapshot_id: String::new(),
+            declaration_fingerprint: identity::range_fingerprint(
+                self.source,
+                declaration.start().to_usize(),
+                declaration.end().to_usize(),
+                Language::Python,
+            ),
+            body_fingerprint: identity::range_fingerprint(
+                self.source,
+                body.start().to_usize(),
+                body.end().to_usize(),
+                Language::Python,
+            ),
             name,
             kind,
             category: self.category,
@@ -457,6 +491,16 @@ impl<'a> UnitCollector<'a> {
             parts.join("::")
         }
     }
+}
+
+fn body_range(body: &[Stmt]) -> Option<TextRange> {
+    let start = body.first()?.range().start();
+    let end = body.last()?.range().end();
+    Some(TextRange::new(start, end))
+}
+
+fn declaration_range(range: TextRange, body: TextRange) -> TextRange {
+    TextRange::new(range.start(), body.start().max(range.start()))
 }
 
 fn initializer_has_work(body: &[Stmt], metrics: &Metrics) -> bool {

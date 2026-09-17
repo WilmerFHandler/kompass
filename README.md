@@ -27,7 +27,7 @@ fn increment(value: i32) -> i32 {
 the normal text report is:
 
 ```text
-Kompass 0.2.0 · Rust structural complexity · structural-v4
+Kompass 0.3.0 · Rust structural complexity · structural-v4
 /work/my-project
 1 files · 4 code lines · 20 tokens
 Languages · 1 Rust files · 0 Python files
@@ -62,6 +62,7 @@ kompass diff BEFORE.json AFTER.json
                                Compare two complete reports from the same root
     --format text|json         Choose human or machine-readable comparison output
     --allow-file-changes       Permit file-set changes with an explicit warning
+    --allow-root-change        Permit equivalent absolute roots while retaining relative scope checks
 ```
 
 ### Agent workflow
@@ -79,7 +80,13 @@ kompass diff before.json after.json
 
 Run the relevant behavior tests separately because a score comparison cannot
 prove that behavior is preserved. Only compare reports whose top-level `model`
-and `analysis_contract` values match.
+and `analysis_contract` values match, with current `schema_version` and
+`evidence_version` fields. Every `files[].functions[]` unit has a unique
+`snapshot_id` plus declaration and body lexical fingerprints. Diff matching
+uses unique evidence stages and reports its `match_basis`; ambiguous units stay
+unmatched, and moved units appear in `functions.moved`. `language_deltas`
+partitions burden and score components by source language so they reconcile with
+the repository totals. Compact or partial reports are rejected as baselines.
 
 `summary.burden.production` is the production burden in exact integer tenths,
 so `143` means `14.3`. The same report has separate `summary.burden.test` and
@@ -106,8 +113,9 @@ jq '{production_tenths: .summary.burden.production,
 The comparison command validates the tool, score model, frontend/discovery
 analysis contract, and canonical root,
 the exact discovered file set, and complete coverage before calculating a
-delta. It reports changed, added, and removed callables, production and test
+delta. It reports changed, added, removed, and moved callables, production and test
 burden deltas, callable-count/p95/highest-score deltas, per-file burden deltas,
+per-language burden and component deltas,
 the largest score-component changes, and macro-opacity deltas. When a file has
 both reduced matched callables and added burden while its category total stays
 level or rises, it emits a possible-redistribution signal. That signal proves
@@ -117,6 +125,9 @@ By default it exits with status 2 and explains the mismatch when either report
 is partial, has analysis errors, or describes a different scope. Pass
 `--allow-file-changes` to compare changed file sets; the output then lists
 added and removed files and warns that aggregate deltas include them.
+Pass `--allow-root-change` when equivalent checkouts use different absolute
+roots; file paths are compared relative to each report root and all other
+compatibility checks still apply.
 
 `macro_opacity.invocations` and `macro_opacity.source_tokens` count macro
 invocation source as written without expansion, including built-in macros.

@@ -45,6 +45,7 @@ fn help_explains_agent_workflow_and_json_contract() {
         "scored and summarized separately",
         "--top",
         "--sort",
+        "--allow-root-change",
         "text output only",
         "top-level `model` and `analysis_contract` values match",
         "coverage.complete",
@@ -95,6 +96,8 @@ fn json_report_contains_separate_categories_and_tokens() {
     assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["model"], "structural-v4");
+    assert_eq!(report["schema_version"], "report-v2");
+    assert_eq!(report["evidence_version"], "evidence-v1");
     assert_eq!(report["analysis_contract"]["version"], "analysis-v1");
     assert_eq!(
         report["analysis_contract"]["discovery"],
@@ -111,6 +114,73 @@ fn json_report_contains_separate_categories_and_tokens() {
             .as_u64()
             .unwrap()
             > 0
+    );
+    assert!(
+        report["files"][0]["functions"][0]["snapshot_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("identity-v1:snapshot:"))
+    );
+    assert!(
+        report["files"][0]["functions"][0]["declaration_fingerprint"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("identity-v1:fnv1a64:"))
+    );
+    assert!(
+        report["files"][0]["functions"][0]["body_fingerprint"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("identity-v1:fnv1a64:"))
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn diff_allows_an_explicit_root_override() {
+    let root = temporary_directory("root-override");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("main.rs"), "fn run() {}\n").unwrap();
+    let before = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args(["--format", "json", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(before.status.success());
+    let before_path = root.join("before.json");
+    let after_path = root.join("after.json");
+    std::fs::write(&before_path, &before.stdout).unwrap();
+    let mut after: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    after["root"] = serde_json::Value::String("/equivalent-worktree".to_owned());
+    std::fs::write(&after_path, serde_json::to_vec_pretty(&after).unwrap()).unwrap();
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args([
+            "diff",
+            before_path.to_str().unwrap(),
+            after_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("--allow-root-change"));
+
+    let accepted = Command::new(env!("CARGO_BIN_EXE_kompass"))
+        .args([
+            "diff",
+            "--allow-root-change",
+            "--format",
+            "json",
+            before_path.to_str().unwrap(),
+            after_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(accepted.status.success());
+    let comparison: serde_json::Value = serde_json::from_slice(&accepted.stdout).unwrap();
+    assert!(
+        comparison["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("roots differ"))
     );
 
     std::fs::remove_dir_all(root).unwrap();
@@ -285,7 +355,7 @@ fn text_shows_the_exact_operation_breakdown() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("Kompass 0.2.0 · Rust structural complexity · structural-v4"));
+    assert!(text.contains("Kompass 0.3.0 · Rust structural complexity · structural-v4"));
     assert!(text.contains(
         "score: 1.4 = 1.0 boundary + 0.0 control decisions + 0.0 nesting + 0.0 boolean operators + 0.2 expression operations + 0.0 call sites + 0.2 explicit parameters + 0.0 match arms"
     ));
@@ -337,12 +407,9 @@ fn diff_reports_show_function_groups_burden_components_and_opacity() {
     let text = String::from_utf8_lossy(&comparison.stdout);
     for expected in [
         "Production burden",
-        "Changed callables · 1",
-        "Added callables · 1",
-        "Removed callables · 1",
+        "Changed callables · 2",
         "stable",
         "added",
-        "removed",
         "Top score component deltas",
         "Macro opacity",
         "Callable summary deltas",
@@ -367,9 +434,9 @@ fn diff_reports_show_function_groups_burden_components_and_opacity() {
     assert!(json.status.success());
     let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(report["comparable"], true);
-    assert_eq!(report["functions"]["changed"].as_array().unwrap().len(), 1);
-    assert_eq!(report["functions"]["added"].as_array().unwrap().len(), 1);
-    assert_eq!(report["functions"]["removed"].as_array().unwrap().len(), 1);
+    assert_eq!(report["functions"]["changed"].as_array().unwrap().len(), 2);
+    assert_eq!(report["functions"]["added"].as_array().unwrap().len(), 0);
+    assert_eq!(report["functions"]["removed"].as_array().unwrap().len(), 0);
     assert!(report["callables"]["production"]["p95_score"].is_object());
     assert_eq!(report["file_burdens"].as_array().unwrap().len(), 1);
     assert_eq!(report["macro_opacity"]["invocations"]["delta"], 0);
