@@ -127,11 +127,15 @@ fn canonical_tokens(source: &str, language: Language) -> Vec<u8> {
             continue;
         }
 
-        if language == Language::Rust && bytes[index..].starts_with(b"//") {
+        if (language.is_javascript_family() || language == Language::Rust)
+            && bytes[index..].starts_with(b"//")
+        {
             index = skip_line_comment(bytes, index);
             continue;
         }
-        if language == Language::Rust && bytes[index..].starts_with(b"/*") {
+        if (language.is_javascript_family() || language == Language::Rust)
+            && bytes[index..].starts_with(b"/*")
+        {
             index = skip_block_comment(bytes, index);
             continue;
         }
@@ -198,7 +202,8 @@ fn skip_block_comment(bytes: &[u8], mut index: usize) -> usize {
 
 fn quoted_literal_end(bytes: &[u8], start: usize, language: Language) -> Option<usize> {
     let quote = *bytes.get(start)?;
-    if !matches!(quote, b'\'' | b'"') {
+    let javascript_template = language.is_javascript_family() && quote == b'`';
+    if !matches!(quote, b'\'' | b'"') && !javascript_template {
         return None;
     }
     // Rust lifetimes and labels begin with a single quote but are not string
@@ -335,6 +340,20 @@ mod tests {
         assert_eq!(
             lexical_fingerprint(before, 0, before.len(), Language::Python),
             lexical_fingerprint(after, 0, after.len(), Language::Python)
+        );
+    }
+
+    #[test]
+    fn javascript_comments_and_templates_are_lexically_opaque() {
+        let before = "const render = () => `// literal ${value}`; /* comment */ render();";
+        let after = "const render=()=>`// literal ${value}`; /* changed */ render();";
+        assert_eq!(
+            lexical_fingerprint(before, 0, before.len(), Language::JavaScript),
+            lexical_fingerprint(after, 0, after.len(), Language::JavaScript)
+        );
+        assert_eq!(
+            lexical_fingerprint(before, 0, before.len(), Language::TypeScript),
+            lexical_fingerprint(after, 0, after.len(), Language::TypeScript)
         );
     }
 

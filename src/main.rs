@@ -10,7 +10,7 @@ use kompass::{OutputFormat, SortBy, analyze, diff, discover, explain, output};
     name = "kompass",
     version,
     about = "Find the code that takes the most thought to change",
-    long_about = "Analyze Rust and Python source and rank structural hotspots that may take more thought to understand and change.",
+    long_about = "Analyze Rust, Python, JavaScript, and TypeScript source and rank structural hotspots that may take more thought to understand and change.",
     after_help = "Use `kompass --help` for the agent workflow and JSON field meanings.",
     after_long_help = r#"
 Agent workflow:
@@ -28,8 +28,9 @@ Agent workflow:
 For custom automation, `summary.burden.production` is the production burden in
 integer tenths (143 means 14.3). Inspect `files[].burden`,
 `files[].functions[].score.value`, and `files[].functions[].metrics` for file
-and callable detail. `summary.languages` counts Rust and Python files, and
-`summary.by_language` contains their independent aggregates. `scope` records
+and callable detail. `summary.languages` counts Rust, Python, JavaScript, and
+TypeScript files, and `summary.by_language` contains their independent
+aggregates. JSX is reported as JavaScript and TSX as TypeScript. `scope` records
 the selection, requested language filter, and category policy, while
 `analysis_contract` records the frontend and discovery contracts used.
 
@@ -76,6 +77,11 @@ Nested Python functions and lambdas retain their lexical control-flow depth.
 Python input must be UTF-8 without a byte-order mark; unsupported encodings are
 reported as file errors so coverage cannot appear complete.
 
+JavaScript and TypeScript functions, methods, nested functions, and arrow
+callbacks are separate units. JSX is parsed as JavaScript and TSX as TypeScript;
+`.test.*`, `.spec.*`, and `__tests__` paths are test sources. Oxc parses the
+modern ECMAScript and TypeScript syntax without requiring a Node.js runtime.
+
 Compare complete reports with:
      kompass diff BEFORE.json AFTER.json
 The diff command requires the same root, score model, analysis contract, file
@@ -99,7 +105,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Rust or Python file, directory, or Cargo workspace to analyze.
+    /// Rust, Python, JavaScript, or TypeScript file, directory, or Cargo workspace to analyze.
     #[arg(value_name = "PATH", default_value = ".")]
     path: PathBuf,
 
@@ -214,6 +220,10 @@ enum Language {
     All,
     Rust,
     Python,
+    #[value(name = "javascript", alias = "js")]
+    JavaScript,
+    #[value(name = "typescript", alias = "ts")]
+    TypeScript,
 }
 
 impl From<Language> for discover::LanguageFilter {
@@ -222,6 +232,8 @@ impl From<Language> for discover::LanguageFilter {
             Language::All => Self::All,
             Language::Rust => Self::Rust,
             Language::Python => Self::Python,
+            Language::JavaScript => Self::JavaScript,
+            Language::TypeScript => Self::TypeScript,
         }
     }
 }
@@ -338,5 +350,15 @@ mod tests {
     #[test]
     fn tests_and_all_are_mutually_exclusive() {
         assert!(Cli::try_parse_from(["kompass", "--tests", "--all"]).is_err());
+    }
+
+    #[test]
+    fn javascript_language_names_accept_full_names_and_short_aliases() {
+        for value in ["javascript", "js", "typescript", "ts"] {
+            assert!(
+                Cli::try_parse_from(["kompass", "--language", value]).is_ok(),
+                "language value {value:?} should be accepted"
+            );
+        }
     }
 }

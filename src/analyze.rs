@@ -127,6 +127,16 @@ pub fn analyze_with_frontends(
                             .to_owned(),
                 }),
             },
+            // The JavaScript/TypeScript frontend is supplied at this seam by
+            // the Oxc implementation. Keeping an explicit unavailable result
+            // here lets discovery and report work compile independently while
+            // that frontend evolves.
+            Language::JavaScript | Language::TypeScript => Err(AnalysisError {
+                path: None,
+                kind: ErrorKind::Parse,
+                message: "JavaScript/TypeScript frontend is unavailable; build Kompass with the JavaScript frontend"
+                    .to_owned(),
+            }),
         };
         let file_analysis = match file_analysis {
             Ok(file_analysis) => file_analysis,
@@ -1088,6 +1098,12 @@ fn summarize(files: &[FileReport]) -> Summary {
             Language::Python => {
                 summary.languages.python = summary.languages.python.saturating_add(1)
             }
+            Language::JavaScript => {
+                summary.languages.javascript = summary.languages.javascript.saturating_add(1)
+            }
+            Language::TypeScript => {
+                summary.languages.typescript = summary.languages.typescript.saturating_add(1)
+            }
         }
         for function in &file.functions {
             match function.category {
@@ -1109,6 +1125,8 @@ fn summarize(files: &[FileReport]) -> Summary {
     };
     summary.by_language.rust = summarize_language(files, Language::Rust);
     summary.by_language.python = summarize_language(files, Language::Python);
+    summary.by_language.javascript = summarize_language(files, Language::JavaScript);
+    summary.by_language.typescript = summarize_language(files, Language::TypeScript);
     summary
 }
 

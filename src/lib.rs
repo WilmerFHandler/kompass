@@ -1,4 +1,5 @@
-//! Rust source complexity analysis for the `kompass` command-line tool.
+//! Source complexity analysis for Rust, Python, JavaScript, and TypeScript in
+//! the `kompass` command-line tool.
 
 pub mod analyze;
 pub mod diff;

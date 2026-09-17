@@ -108,7 +108,7 @@ fn json_report_contains_separate_categories_and_tokens() {
     assert_eq!(report["analysis_contract"]["version"], "analysis-v1");
     assert_eq!(
         report["analysis_contract"]["discovery"],
-        "multi-language-v1"
+        "multi-language-v2"
     );
     assert_eq!(report["files"][0]["language"], "rust");
     assert_eq!(report["summary"]["languages"]["rust"], 1);
@@ -454,7 +454,7 @@ fn text_shows_the_exact_operation_breakdown() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("Kompass 0.3.0 · Rust structural complexity · structural-v4"));
+    assert!(text.contains("Kompass 0.4.0 · Rust structural complexity · structural-v4"));
     assert!(text.contains(
         "score: 1.4 = 1.0 boundary + 0.0 control decisions + 0.0 nesting + 0.0 boolean operators + 0.2 expression operations + 0.0 call sites + 0.2 explicit parameters + 0.0 match arms"
     ));

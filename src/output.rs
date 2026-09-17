@@ -286,8 +286,8 @@ fn render_text(report: &Report, top: usize, tests: bool, all: bool, sort: SortBy
     let languages = effective_language_counts(report);
     writeln!(
         output,
-        "Languages · {} Rust files · {} Python files",
-        languages.rust, languages.python
+        "Languages · {} Rust files · {} Python files · {} JavaScript files · {} TypeScript files",
+        languages.rust, languages.python, languages.javascript, languages.typescript
     )
     .unwrap();
     render_category_summary(&mut output, "Production", &report.summary.production);
@@ -440,7 +440,11 @@ fn render_evidence_summary(output: &mut String, report: &Report) {
 }
 
 fn effective_language_counts(report: &Report) -> LanguageCounts {
-    if report.summary.languages.rust != 0 || report.summary.languages.python != 0 {
+    if report.summary.languages.rust != 0
+        || report.summary.languages.python != 0
+        || report.summary.languages.javascript != 0
+        || report.summary.languages.typescript != 0
+    {
         return report.summary.languages.clone();
     }
     let mut counts = LanguageCounts::default();
@@ -448,6 +452,8 @@ fn effective_language_counts(report: &Report) -> LanguageCounts {
         match file.language {
             Language::Rust => counts.rust = counts.rust.saturating_add(1),
             Language::Python => counts.python = counts.python.saturating_add(1),
+            Language::JavaScript => counts.javascript = counts.javascript.saturating_add(1),
+            Language::TypeScript => counts.typescript = counts.typescript.saturating_add(1),
         }
     }
     counts
@@ -455,9 +461,17 @@ fn effective_language_counts(report: &Report) -> LanguageCounts {
 
 fn language_header(report: &Report) -> &'static str {
     let languages = effective_language_counts(report);
-    match (languages.rust > 0, languages.python > 0) {
-        (true, false) => "Rust",
-        (false, true) => "Python",
+    let present = [
+        languages.rust > 0,
+        languages.python > 0,
+        languages.javascript > 0,
+        languages.typescript > 0,
+    ];
+    match present {
+        [true, false, false, false] => "Rust",
+        [false, true, false, false] => "Python",
+        [false, false, true, false] => "JavaScript",
+        [false, false, false, true] => "TypeScript",
         _ => "Mixed-language",
     }
 }

@@ -1,7 +1,7 @@
 # Kompass
 
-Kompass is a command-line tool for finding the Rust and Python code that takes
-the most thought to understand and change. It reports a transparent
+Kompass is a command-line tool for finding the Rust, Python, JavaScript, and
+TypeScript code that takes the most thought to understand and change. It reports a transparent
 structural score for every callable and executable initializer, with the
 measurements behind that score, so a large number points to a place worth
 reading rather than pretending to be a precise prediction of developer time.
@@ -14,7 +14,7 @@ Run it from a Cargo package or workspace:
 cargo run --release -- .
 ```
 
-You can pass an explicit directory or a single Rust or Python file. For a file named
+You can pass an explicit directory or a single Rust, Python, JavaScript, or TypeScript file. For a file named
 `README-example.rs` containing this four-line fixture:
 
 ```rust
@@ -27,10 +27,10 @@ fn increment(value: i32) -> i32 {
 the normal text report is:
 
 ```text
-Kompass 0.3.0 · Rust structural complexity · structural-v4
+Kompass 0.4.0 · Rust structural complexity · structural-v4
 /work/my-project
 1 files · 4 code lines · 20 tokens
-Languages · 1 Rust files · 0 Python files
+Languages · 1 Rust files · 0 Python files · 0 JavaScript files · 0 TypeScript files
 Production · 1 callables · total burden 1.3 · average 1.3 · p95 1.3 · highest 1.3
 Tests · 0 callables · total burden 0.0 · average 0.0 · p95 0.0 · highest 0.0
 Repository burden · 1.3 total · 1.3 production · 0.0 tests
@@ -52,7 +52,7 @@ Useful options are:
 
 ```text
 kompass [PATH]                 Analyze the current directory by default
-    --language all|rust|python
+    --language all|rust|python|javascript|typescript
                                Select source languages for directory walks (default all)
     --format text|json         Choose human or machine-readable output
     --compact                  With JSON, return a bounded view marked `analysis_compact`
@@ -85,6 +85,9 @@ Every serialized view includes `schema_version` so consumers can reject incompat
 before reading fields. Full analysis reports identify themselves with `report_kind: "analysis"`;
 `scope` records file/directory selection, the requested language filter, and the production/test
 policy rather than asking consumers to infer them from the result.
+The 0.4 discovery contract is `multi-language-v2`, and the frontend contract records
+`rust-syn-v1`, Ruff Python 3.14, and the pinned Oxc 0.143 frontend for JavaScript and
+TypeScript so reports from different parser or file-selection rules cannot be compared silently.
 
 ### Agent workflow
 
@@ -115,7 +118,8 @@ so `143` means `14.3`. The same report has separate `summary.burden.test` and
 `files[].functions[].score.value` is the exact callable score while
 `files[].functions[].metrics` explains its components. Production and test
 categories use the same score and have separate scores and summaries.
-`summary.by_language` carries the same complete aggregates for Rust and Python independently.
+`summary.by_language` carries the same complete aggregates for Rust, Python, JavaScript,
+and TypeScript independently. JSX is reported as JavaScript and TSX as TypeScript.
 
 JSON includes every analyzed callable and initializer, so `--top`, `--sort`,
 `--tests`, and `--all` affect text output only. Check `coverage` and `errors` before comparing
@@ -173,7 +177,7 @@ status 2. An invalid input path or an output failure also exits with status 2.
 The report's `model` field is always the stable string `structural-v4`.
 `analysis_contract` records the stable frontend and discovery contracts so a
 before/after comparison cannot silently mix parser or file-selection rules.
-Each `files[]` entry has a `language` of `rust` or `python`, and
+Each `files[]` entry has a `language` of `rust`, `python`, `javascript`, or `typescript`, and
 `summary.languages` counts analyzed files by language.
 `score.value` and `score.units` are the exact integer tenths used in the formula,
 while `score.display` is the presentation value; consumers should use the
@@ -216,7 +220,7 @@ filters, and exception handlers. A `with` item is an expression operation, not
 a decision. Assignment, augmented assignment, deletion, and walrus expressions
 are also exposed as mutation signals.
 
-In both languages, `call_sites` counts ordinary and method calls,
+Across all supported languages, `call_sites` counts ordinary and method calls,
 `explicit_parameters` excludes a method receiver, and `match_arms` counts every
 arm or case. Direct Python methods exclude a leading `self` or `cls` unless the
 method is a `staticmethod`. The score is intentionally linear and unbounded, so
@@ -237,7 +241,7 @@ production and test values kept separate. These aggregates make a file with
 several moderate hotspots visible alongside an individual worst callable.
 
 The weights are transparent, provisional hypotheses about reading and changing
-Rust and Python. The `expression_operations` charge is a provisional 0.1-point weight per
+Rust, Python, JavaScript, and TypeScript. The `expression_operations` charge is a provisional 0.1-point weight per
 operation; it has no claim to be empirically optimal or to predict developer
 time. A larger score is not automatically a defect. The checked-in corpus is a
 structural regression and guardrail suite: it contains 13 subjective clarity
@@ -308,17 +312,20 @@ Multi-character punctuation is deliberately frozen as one punctuation token
 per character: `->` counts as two, `::` as two, and `..=` as three. These are
 Rust lexical tokens in Kompass's terminology, not LLM or model tokens. Python
 uses Ruff's lexical stream and excludes comments, newlines, indentation,
-dedentation, and the end marker; docstrings remain string tokens. Both file
-totals come from lexing the complete file once, so they are not the sum of
-overlapping callable spans. Python input must be UTF-8 without a byte-order mark;
-unsupported encodings are reported as read errors and make coverage partial.
+dedentation, and the end marker; docstrings remain string tokens. JavaScript and
+TypeScript use Oxc's lexical stream, with JSX and TSX parsed according to their
+source language. Both file totals come from lexing the complete file once, so
+they are not the sum of overlapping callable spans. Python input must be UTF-8
+without a byte-order mark; unsupported encodings are reported as read errors
+and make coverage partial.
 
 ## Source-only evidence
 
 JSON reports also contain `evidence` under the `evidence-v1` contract. Call
 coverage counts every syntactic call site, then separates unique direct local
-function matches from unresolved and ambiguous sites. Rust and Python frontends
-explicitly leave methods, qualified calls, imports, parameters, assignments,
+function matches from unresolved and ambiguous sites. Rust, Python, JavaScript,
+and TypeScript frontends explicitly leave methods, qualified calls, imports,
+parameters, assignments,
 aliases, and dynamic callees unresolved because source text alone cannot prove
 which implementation will run. A call region follows only resolved local
 edges, includes each reachable callable once, sums its existing burden once,
@@ -344,25 +351,31 @@ still required before treating a refactor as a candidate for review.
 
 At a Cargo manifest root Kompass asks Cargo for workspace packages, walks each
 package root for Rust sources, and uses Cargo's target kinds to classify
-integration tests and benchmarks. Python files are walked from the requested
-root, including scripts outside Cargo package roots. A standalone directory is
-walked recursively in deterministic order. Build output, Git metadata, Cargo
-metadata, vendored dependencies, Node modules, `.venv`, `venv`, `__pycache__`,
-`.tox`, `.nox`, and directories containing `pyvenv.cfg` are skipped, while
-`.gitignore` and `.ignore` rules are respected. An explicit source file is
-always analyzed even when it is ignored or outside the selected language.
+integration tests and benchmarks. Python, JavaScript, and TypeScript files are
+walked from the requested root, including scripts and app sources outside
+Cargo package roots. A standalone directory is walked recursively in
+deterministic order. Build output, Git metadata, Cargo metadata, vendored
+dependencies, Node modules, `.venv`, `venv`, `__pycache__`, `.tox`, `.nox`,
+coverage and generated/build trees such as `dist`, `build`, `.next`, `.expo`,
+and `generated` are skipped, while `.gitignore` and `.ignore` rules are
+respected. An explicit source file is always analyzed even when it is ignored
+or outside the selected language.
 
 Python files are classified as tests when any path component is `tests`, the
-file is named `test_*.py`, `*_test.py`, or `conftest.py`. Rust tests retain the
-existing Cargo and syntax-level classification. `--language` filters directory
-walks and defaults to `all`; it does not override an explicit file.
+file is named `test_*.py`, `*_test.py`, or `conftest.py`. JavaScript and
+TypeScript files are classified as tests under `test`, `tests`, or `__tests__`
+directories and for `.test.*`, `.spec.*`, `test_*`, and `*_test.*` names. Rust
+tests retain the existing Cargo and syntax-level classification. `--language`
+filters directory walks and defaults to `all`; it does not override an
+explicit file.
 
-Rust parsing uses `syn` and Python parsing uses the Ruff Python frontend with
-the Python 3.14 grammar; analysis is performed on the source that is present on disk. Macro expansion,
-type resolution, generated functions, and configuration evaluation are outside
-v0.1, so they are not silently presented as measured complexity. A source file
-that cannot be read, lexed, or parsed appears in the report's `errors` list and
-reduces the reported coverage.
+Rust parsing uses `syn`, Python parsing uses the Ruff Python frontend with the
+Python 3.14 grammar, and JavaScript/TypeScript parsing uses Oxc with JSX/TSX
+support. Analysis is performed on the source that is present on disk. Macro
+expansion, type resolution, generated functions, and configuration evaluation
+are outside the source-only contract, so they are not silently presented as
+measured complexity. A source file that cannot be read, lexed, or parsed
+appears in the report's `errors` list and reduces the reported coverage.
 
 ## Development
 

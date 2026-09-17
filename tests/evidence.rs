@@ -21,6 +21,8 @@ fn report(source: &str, language: Language) -> kompass::Report {
     let extension = match language {
         Language::Rust => "rs",
         Language::Python => "py",
+        Language::JavaScript => "js",
+        Language::TypeScript => "ts",
     };
     let path = root.join(format!("main.{extension}"));
     std::fs::write(&path, source).unwrap();

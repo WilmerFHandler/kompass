@@ -4,13 +4,17 @@ use serde::{Deserialize, Serialize};
 pub const SCORE_MODEL: &str = "structural-v4";
 
 /// Stable identity of the source discovery contract used by a report.
-pub const DISCOVERY_CONTRACT: &str = "multi-language-v1";
+///
+/// The v2 contract adds JavaScript and TypeScript source selection, including
+/// JSX/TSX extensions and their test/build-tree conventions.
+pub const DISCOVERY_CONTRACT: &str = "multi-language-v2";
 
 /// Stable identity of the language frontend contract used by a report.
 ///
 /// The implementation behind a frontend may evolve while this contract stays
 /// fixed only when its serialized `FileAnalysis` semantics remain compatible.
-pub const FRONTEND_CONTRACT: &str = "rust-syn-v1;python-ruff-0.0.10-py314";
+pub const FRONTEND_CONTRACT: &str =
+    "rust-syn-v1;python-ruff-0.0.10-py314;javascript-oxc-0.143.0;typescript-oxc-0.143.0";
 
 /// Stable identity of the complete analysis contract. It intentionally keeps
 /// the score model separate so consumers can tell formula changes from parser
@@ -78,6 +82,8 @@ pub struct Summary {
 pub struct LanguageSummaries {
     pub rust: LanguageSummary,
     pub python: LanguageSummary,
+    pub javascript: LanguageSummary,
+    pub typescript: LanguageSummary,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -95,6 +101,8 @@ pub struct LanguageSummary {
 pub struct LanguageCounts {
     pub rust: usize,
     pub python: usize,
+    pub javascript: usize,
+    pub typescript: usize,
 }
 
 /// Versioned contract for discovery and frontend semantics.
@@ -240,6 +248,8 @@ pub enum Category {
 pub enum Language {
     Rust,
     Python,
+    JavaScript,
+    TypeScript,
 }
 
 impl Language {
@@ -247,6 +257,8 @@ impl Language {
         match self {
             Self::Rust => "Rust",
             Self::Python => "Python",
+            Self::JavaScript => "JavaScript",
+            Self::TypeScript => "TypeScript",
         }
     }
 
@@ -254,7 +266,16 @@ impl Language {
         match self {
             Self::Rust => "rust",
             Self::Python => "python",
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
         }
+    }
+
+    /// Whether this source language uses the JavaScript/TypeScript frontend
+    /// and C-style comments. JSX and TSX are selected by their TypeScript or
+    /// JavaScript file language, so callers do not need a second enum.
+    pub const fn is_javascript_family(self) -> bool {
+        matches!(self, Self::JavaScript | Self::TypeScript)
     }
 }
 

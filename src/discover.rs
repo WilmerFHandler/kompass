@@ -50,20 +50,27 @@ impl Error for DiscoveryError {}
 
 /// Languages that can be selected by the command line. Explicit source files
 /// always win over this filter, so `kompass --language rust script.py` still
-/// analyzes the requested file.
+/// analyzes the requested file. JavaScript includes `.js` and `.jsx`, while
+/// TypeScript includes `.ts` and `.tsx`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum LanguageFilter {
     #[default]
     All,
     Rust,
     Python,
+    JavaScript,
+    TypeScript,
 }
 
 impl LanguageFilter {
     pub const fn includes(self, language: Language) -> bool {
         matches!(
             (self, language),
-            (Self::All, _) | (Self::Rust, Language::Rust) | (Self::Python, Language::Python)
+            (Self::All, _)
+                | (Self::Rust, Language::Rust)
+                | (Self::Python, Language::Python)
+                | (Self::JavaScript, Language::JavaScript)
+                | (Self::TypeScript, Language::TypeScript)
         )
     }
 
@@ -72,6 +79,8 @@ impl LanguageFilter {
             Self::All => "all",
             Self::Rust => "rust",
             Self::Python => "python",
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
         }
     }
 }
@@ -98,7 +107,7 @@ pub fn discover_with_language(
     if path.is_file() {
         let Some(language) = language_for_path(&path) else {
             return Err(DiscoveryError::new(format!(
-                "'{}' is not a Rust or Python source file",
+                "'{}' is not a Rust, Python, JavaScript, or TypeScript source file",
                 input.display()
             )));
         };
@@ -184,8 +193,7 @@ fn discover_cargo_targets(
             manifest.display()
         ))
     })?;
-    let mut paths = BTreeSet::new();
-    let mut python_paths = BTreeSet::new();
+    let mut paths = SourcePaths::default();
     let mut package_roots = BTreeSet::new();
     let mut test_target_paths = BTreeSet::new();
 
@@ -202,7 +210,7 @@ fn discover_cargo_targets(
             // Cargo target paths are authoritative, including custom targets
             // deliberately kept outside a package root or ignored by a
             // repository rule.
-            paths.insert(path.clone());
+            paths.rust.insert(path.clone());
             if target
                 .kind
                 .iter()
@@ -214,52 +222,30 @@ fn discover_cargo_targets(
     }
 
     for package_root in package_roots {
-        walk(
-            &package_root,
-            &mut paths,
-            &mut BTreeSet::new(),
-            LanguageFilter::Rust,
-        )
-        .map_err(|error| {
+        let mut package_paths = SourcePaths::default();
+        walk(&package_root, &mut package_paths, LanguageFilter::Rust).map_err(|error| {
             DiscoveryError::new(format!("cannot scan '{}': {error}", package_root.display()))
         })?;
+        paths.rust.extend(package_paths.rust);
     }
 
-    // Python projects commonly live beside, or outside, a Rust package. Scan
+    // Non-Rust projects commonly live beside, or outside, a Rust package. Scan
     // the requested root separately so Cargo's package-root restriction for
-    // Rust does not hide scripts and tests.
-    if language_filter.includes(Language::Python) {
-        walk(
-            root,
-            &mut BTreeSet::new(),
-            &mut python_paths,
-            LanguageFilter::Python,
-        )
-        .map_err(|error| {
+    // Rust does not hide Python, JavaScript, or TypeScript sources and tests.
+    if language_filter.includes(Language::Python)
+        || language_filter.includes(Language::JavaScript)
+        || language_filter.includes(Language::TypeScript)
+    {
+        let mut root_paths = SourcePaths::default();
+        walk(root, &mut root_paths, language_filter).map_err(|error| {
             DiscoveryError::new(format!("cannot scan '{}': {error}", root.display()))
         })?;
+        paths.python.extend(root_paths.python);
+        paths.javascript.extend(root_paths.javascript);
+        paths.typescript.extend(root_paths.typescript);
     }
 
-    let mut files = paths
-        .into_iter()
-        .map(|path| {
-            let category = if is_test_path(&path) || test_target_paths.contains(&path) {
-                Category::Test
-            } else {
-                Category::Production
-            };
-            DiscoveredFile {
-                path,
-                language: Language::Rust,
-                category,
-            }
-        })
-        .collect::<Vec<_>>();
-    files.extend(python_paths.into_iter().map(|path| DiscoveredFile {
-        category: category_for_path(&path, Language::Python),
-        language: Language::Python,
-        path,
-    }));
+    let mut files = files_from_paths(paths, &test_target_paths);
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let test_files = files
         .iter()
@@ -275,23 +261,10 @@ fn discover_cargo_targets(
 }
 
 fn discover_filesystem(root: &Path, language_filter: LanguageFilter) -> std::io::Result<Discovery> {
-    let mut paths = BTreeSet::new();
-    let mut python_paths = BTreeSet::new();
-    walk(root, &mut paths, &mut python_paths, language_filter)?;
+    let mut paths = SourcePaths::default();
+    walk(root, &mut paths, language_filter)?;
 
-    let mut files = paths
-        .into_iter()
-        .map(|path| DiscoveredFile {
-            category: category_for_path(&path, Language::Rust),
-            language: Language::Rust,
-            path,
-        })
-        .collect::<Vec<_>>();
-    files.extend(python_paths.into_iter().map(|path| DiscoveredFile {
-        category: category_for_path(&path, Language::Python),
-        language: Language::Python,
-        path,
-    }));
+    let mut files = files_from_paths(paths, &BTreeSet::new());
     files.sort_by(|left, right| left.path.cmp(&right.path));
 
     Ok(Discovery {
@@ -305,10 +278,57 @@ fn discover_filesystem(root: &Path, language_filter: LanguageFilter) -> std::io:
     })
 }
 
+#[derive(Debug, Default)]
+struct SourcePaths {
+    rust: BTreeSet<PathBuf>,
+    python: BTreeSet<PathBuf>,
+    javascript: BTreeSet<PathBuf>,
+    typescript: BTreeSet<PathBuf>,
+}
+
+fn files_from_paths(
+    paths: SourcePaths,
+    rust_test_target_paths: &BTreeSet<PathBuf>,
+) -> Vec<DiscoveredFile> {
+    let SourcePaths {
+        rust,
+        python,
+        javascript,
+        typescript,
+    } = paths;
+    let mut files = rust
+        .into_iter()
+        .map(|path| DiscoveredFile {
+            category: if is_test_path(&path) || rust_test_target_paths.contains(&path) {
+                Category::Test
+            } else {
+                Category::Production
+            },
+            language: Language::Rust,
+            path,
+        })
+        .collect::<Vec<_>>();
+    files.extend(python.into_iter().map(|path| DiscoveredFile {
+        category: category_for_path(&path, Language::Python),
+        language: Language::Python,
+        path,
+    }));
+    files.extend(javascript.into_iter().map(|path| DiscoveredFile {
+        category: category_for_path(&path, Language::JavaScript),
+        language: Language::JavaScript,
+        path,
+    }));
+    files.extend(typescript.into_iter().map(|path| DiscoveredFile {
+        category: category_for_path(&path, Language::TypeScript),
+        language: Language::TypeScript,
+        path,
+    }));
+    files
+}
+
 fn walk(
     directory: &Path,
-    rust_paths: &mut BTreeSet<PathBuf>,
-    python_paths: &mut BTreeSet<PathBuf>,
+    paths: &mut SourcePaths,
     language_filter: LanguageFilter,
 ) -> std::io::Result<()> {
     let mut builder = WalkBuilder::new(directory);
@@ -326,10 +346,22 @@ fn walk(
         let path = entry.into_path();
         match language_for_path(&path) {
             Some(Language::Rust) if language_filter.includes(Language::Rust) => {
-                rust_paths.insert(path);
+                paths.rust.insert(path);
             }
             Some(Language::Python) if language_filter.includes(Language::Python) => {
-                python_paths.insert(path);
+                paths.python.insert(path);
+            }
+            Some(Language::JavaScript)
+                if language_filter.includes(Language::JavaScript)
+                    && !is_excluded_source_path(&path) =>
+            {
+                paths.javascript.insert(path);
+            }
+            Some(Language::TypeScript)
+                if language_filter.includes(Language::TypeScript)
+                    && !is_excluded_source_path(&path) =>
+            {
+                paths.typescript.insert(path);
             }
             _ => {}
         }
@@ -363,6 +395,15 @@ fn should_skip_directory(path: &Path) -> bool {
                         | "__pycache__"
                         | ".tox"
                         | ".nox"
+                        | "coverage"
+                        | "dist"
+                        | "build"
+                        | "out"
+                        | "generated"
+                        | ".next"
+                        | ".expo"
+                        | ".turbo"
+                        | "storybook-static"
                 )
             )
         })
@@ -376,18 +417,77 @@ fn is_python_file(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension == "py")
 }
 
+fn is_javascript_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| matches!(extension.to_str(), Some("js" | "jsx")))
+}
+
+fn is_typescript_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| matches!(extension.to_str(), Some("ts" | "tsx")))
+}
+
+fn is_javascript_family_file(path: &Path) -> bool {
+    is_javascript_file(path) || is_typescript_file(path)
+}
+
+/// Generated declarations, bundles, and source trees are intentionally left
+/// out of recursive source discovery. Explicit source paths retain the
+/// existing authoritative-file behavior and can still be analyzed directly.
+fn is_excluded_source_path(path: &Path) -> bool {
+    if !is_javascript_family_file(path) {
+        return false;
+    }
+    is_declaration_file(path) || is_bundle_file(path) || is_generated_file(path)
+}
+
+fn is_declaration_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".d.ts"))
+}
+
+fn is_bundle_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name == "bundle.js"
+        || name == "bundle.jsx"
+        || name == "bundle.ts"
+        || name == "bundle.tsx"
+        || [".bundle.", ".chunk.", ".min.", ".map."]
+            .iter()
+            .any(|marker| name.contains(marker))
+}
+
+fn is_generated_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with("generated.")
+        || [".generated.", ".gen.", ".g."]
+            .iter()
+            .any(|marker| name.contains(marker))
+}
+
 fn language_for_path(path: &Path) -> Option<Language> {
     if is_rust_file(path) {
         Some(Language::Rust)
     } else if is_python_file(path) {
         Some(Language::Python)
+    } else if is_javascript_file(path) {
+        Some(Language::JavaScript)
+    } else if is_typescript_file(path) {
+        Some(Language::TypeScript)
     } else {
         None
     }
 }
 
 fn category_for_path(path: &Path, language: Language) -> Category {
-    if language == Language::Python && is_python_test_path(path) {
+    if (language == Language::Python && is_python_test_path(path))
+        || (language.is_javascript_family() && is_javascript_test_path(path))
+    {
         Category::Test
     } else {
         Category::Production
@@ -415,6 +515,44 @@ fn is_python_test_path(path: &Path) -> bool {
     }) || file_name == "conftest.py"
         || file_name.starts_with("test_") && file_name.ends_with(".py")
         || file_name.ends_with("_test.py")
+}
+
+fn is_javascript_test_path(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let path_test_directory = path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| matches!(name, "test" | "tests" | "__tests__"))
+    });
+    let file_test_suffix = [
+        ".test.js",
+        ".test.jsx",
+        ".test.ts",
+        ".test.tsx",
+        ".spec.js",
+        ".spec.jsx",
+        ".spec.ts",
+        ".spec.tsx",
+    ]
+    .iter()
+    .any(|suffix| file_name.ends_with(suffix));
+    let conventional_test_name = [
+        "test.js",
+        "test.jsx",
+        "test.ts",
+        "test.tsx",
+        "_test.js",
+        "_test.jsx",
+        "_test.ts",
+        "_test.tsx",
+    ]
+    .iter()
+    .any(|suffix| file_name.ends_with(suffix))
+        || file_name.starts_with("test_");
+    path_test_directory || file_test_suffix || conventional_test_name
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,6 +594,22 @@ mod tests {
         assert!(LanguageFilter::All.includes(Language::Python));
         assert!(LanguageFilter::Python.includes(Language::Python));
         assert!(!LanguageFilter::Python.includes(Language::Rust));
+        assert!(LanguageFilter::JavaScript.includes(Language::JavaScript));
+        assert!(!LanguageFilter::JavaScript.includes(Language::TypeScript));
+        assert!(LanguageFilter::TypeScript.includes(Language::TypeScript));
+        assert!(!LanguageFilter::TypeScript.includes(Language::JavaScript));
+        assert!(is_javascript_test_path(Path::new("src/Widget.test.jsx")));
+        assert!(is_javascript_test_path(Path::new("src/Widget.spec.tsx")));
+        assert!(is_javascript_test_path(Path::new("__tests__/Widget.tsx")));
+        assert!(!is_javascript_test_path(Path::new("src/test-utils.ts")));
+        assert_eq!(
+            language_for_path(Path::new("src/App.jsx")),
+            Some(Language::JavaScript)
+        );
+        assert_eq!(
+            language_for_path(Path::new("src/App.tsx")),
+            Some(Language::TypeScript)
+        );
     }
 
     #[test]
@@ -463,7 +617,156 @@ mod tests {
         assert!(should_skip_directory(Path::new("target")));
         assert!(should_skip_directory(Path::new(".git")));
         assert!(should_skip_directory(Path::new("vendor")));
+        assert!(should_skip_directory(Path::new("coverage")));
+        assert!(should_skip_directory(Path::new(".next")));
+        assert!(should_skip_directory(Path::new(".expo")));
+        assert!(should_skip_directory(Path::new("generated")));
+        assert!(!should_skip_directory(Path::new("ios")));
+        assert!(!should_skip_directory(Path::new("android")));
         assert!(!should_skip_directory(Path::new("src")));
+    }
+
+    #[test]
+    fn javascript_and_typescript_discovery_covers_react_trees_without_generated_files() {
+        let root = std::env::temp_dir().join(format!(
+            "kompass-javascript-discovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for directory in [
+            "src",
+            "ios",
+            "android",
+            "android/build",
+            "__tests__",
+            "tests",
+            "node_modules/pkg",
+            "coverage",
+            "dist",
+            ".next",
+            ".expo",
+            "generated",
+            "ignored",
+        ] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        for (path, source) in [
+            ("src/App.jsx", "export function App() { return null; }\n"),
+            ("src/App.tsx", "export function App() { return null; }\n"),
+            ("src/testHelpers.ts", "export function helper() {}\n"),
+            ("ios/App.tsx", "export function NativeApp() {}\n"),
+            ("android/App.tsx", "export function NativeApp() {}\n"),
+            (
+                "__tests__/App.test.jsx",
+                "test('app', () => render(<App />));\n",
+            ),
+            (
+                "tests/App.spec.tsx",
+                "test('app', () => render(<App />));\n",
+            ),
+            (
+                "node_modules/pkg/index.ts",
+                "export function dependency() {}\n",
+            ),
+            ("coverage/report.ts", "export function coverage() {}\n"),
+            ("dist/index.js", "export function bundle() {}\n"),
+            (".next/page.tsx", "export function page() {}\n"),
+            (".expo/config.ts", "export function config() {}\n"),
+            ("generated/api.ts", "export function generated() {}\n"),
+            ("android/build/output.ts", "export function output() {}\n"),
+            ("types.d.ts", "export interface Types {}\n"),
+            ("app.min.js", "function min() {}\n"),
+            ("app.bundle.js", "function bundle() {}\n"),
+            ("src/api.generated.ts", "export function generated() {}\n"),
+            ("ignored/ignored.ts", "export function ignored() {}\n"),
+        ] {
+            std::fs::write(root.join(path), source).unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(root.join(".ignore"), "ignored/\n").unwrap();
+
+        let discovery = discover_with_language(&root, LanguageFilter::All).unwrap();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let discovered = discovery
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.path
+                        .strip_prefix(&canonical_root)
+                        .unwrap()
+                        .to_path_buf(),
+                    file.language,
+                    file.category,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(discovered.len(), 7);
+        assert!(discovered.contains(&(
+            PathBuf::from("src/App.jsx"),
+            Language::JavaScript,
+            Category::Production
+        )));
+        assert!(discovered.contains(&(
+            PathBuf::from("__tests__/App.test.jsx"),
+            Language::JavaScript,
+            Category::Test
+        )));
+        assert!(discovered.contains(&(
+            PathBuf::from("tests/App.spec.tsx"),
+            Language::TypeScript,
+            Category::Test
+        )));
+        assert!(discovered.contains(&(
+            PathBuf::from("src/testHelpers.ts"),
+            Language::TypeScript,
+            Category::Production
+        )));
+        assert!(discovered.contains(&(
+            PathBuf::from("ios/App.tsx"),
+            Language::TypeScript,
+            Category::Production
+        )));
+        assert!(discovered.contains(&(
+            PathBuf::from("android/App.tsx"),
+            Language::TypeScript,
+            Category::Production
+        )));
+        assert!(discovered.contains(&(
+            PathBuf::from("src/App.tsx"),
+            Language::TypeScript,
+            Category::Production
+        )));
+        assert_eq!(discovery.test_files, 2);
+
+        let javascript = discover_with_language(&root, LanguageFilter::JavaScript).unwrap();
+        assert_eq!(
+            javascript
+                .files
+                .iter()
+                .map(|file| file.language)
+                .collect::<Vec<_>>(),
+            vec![Language::JavaScript, Language::JavaScript]
+        );
+        let typescript = discover_with_language(&root, LanguageFilter::TypeScript).unwrap();
+        assert_eq!(typescript.files.len(), 5);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn javascript_exclusions_are_only_applied_to_recursive_walks() {
+        assert!(is_excluded_source_path(Path::new("types.d.ts")));
+        assert!(is_excluded_source_path(Path::new("app.bundle.js")));
+        assert!(is_excluded_source_path(Path::new("bundle.js")));
+        assert!(is_excluded_source_path(Path::new("app.min.tsx")));
+        assert!(is_excluded_source_path(Path::new("api.generated.ts")));
+        assert!(is_excluded_source_path(Path::new("generated.ts")));
+        assert!(!is_excluded_source_path(Path::new("src/App.tsx")));
+        assert!(!is_excluded_source_path(Path::new("src/App.py")));
     }
 
     #[test]
