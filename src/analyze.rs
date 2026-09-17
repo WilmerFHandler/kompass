@@ -2,12 +2,17 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use quote::ToTokens;
 use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Attribute, FnArg, ItemConst, ItemFn, ItemMod, ItemStatic, Meta, Token};
+use syn::{
+    Attribute, Expr, ExprBinary, ExprCall, ExprCast, ExprClosure, ExprIf, ExprIndex, ExprMatch,
+    ExprMethodCall, ExprUnary, FnArg, ItemConst, ItemFn, ItemMod, ItemStatic, Meta, Stmt, Token,
+};
 
 use crate::discover::{DiscoveredFile, Discovery};
+use crate::evidence::EvidenceFile;
 use crate::identity;
 use crate::model::{
     AnalysisContract, AnalysisError, Burden, Category, CategorySummary, Coverage, ErrorKind,
@@ -57,6 +62,7 @@ pub fn analyze_with_frontends(
         .collect::<BTreeSet<_>>();
     test_files.extend(test_context_files.iter().cloned());
     let mut files = Vec::new();
+    let mut evidence_files = Vec::new();
     let mut errors = Vec::new();
 
     for DiscoveredFile {
@@ -115,14 +121,24 @@ pub fn analyze_with_frontends(
         let mut file_analysis = file_analysis;
         identity::assign_snapshot_ids(&display_path, language, &mut file_analysis.functions);
         let burden = summarize_burden(&file_analysis.functions);
+        let frontend_evidence = file_analysis.evidence.clone();
         files.push(FileReport {
-            path: display_path,
+            path: display_path.clone(),
             language,
             lines: file_analysis.lines,
             tokens: file_analysis.tokens,
             functions: file_analysis.functions,
             burden,
             macro_opacity: file_analysis.macro_opacity,
+        });
+        evidence_files.push(EvidenceFile {
+            path: display_path,
+            language,
+            functions: files
+                .last()
+                .map(|file| file.functions.clone())
+                .unwrap_or_default(),
+            frontend: frontend_evidence,
         });
     }
 
@@ -139,6 +155,7 @@ pub fn analyze_with_frontends(
     }
 
     let summary = summarize(&files);
+    let evidence = crate::evidence::build(&evidence_files);
     let macro_opacity = summarize_macro_opacity(&files);
     let analyzed_files = files.len();
     let failed_files = errors.len();
@@ -162,6 +179,7 @@ pub fn analyze_with_frontends(
         summary,
         coverage,
         macro_opacity,
+        evidence,
         files,
         errors,
     }
@@ -180,12 +198,679 @@ fn analyze_rust_file(source: &str, file_is_test: bool) -> Result<FileAnalysis, A
         message: error,
     })?;
     let collected = collect_functions(source, &syntax, &lexed, &line_analysis, file_is_test);
+    let functions = collected.functions;
     Ok(FileAnalysis {
         lines: line_analysis.counts,
         tokens: lexed.total_tokens(),
-        functions: collected.functions,
+        functions: functions.clone(),
         macro_opacity: measure_macro_opacity(&syntax, &lexed),
+        evidence: extract_rust_evidence(&syntax, &functions, file_is_test),
     })
+}
+
+/// Extract only relationships that can be supported by the Rust source AST.
+/// This pass intentionally lives beside the `syn`-owned scoring collector;
+/// `evidence` receives the lowered source facts and performs the common graph
+/// and duplicate analysis without pretending to compile the crate.
+fn extract_rust_evidence(
+    syntax: &syn::File,
+    functions: &[FunctionReport],
+    file_is_test: bool,
+) -> crate::evidence::FrontendEvidence {
+    let imports = rust_imports(syntax);
+    let mut collector = RustEvidenceCollector {
+        functions,
+        imports,
+        test_context: file_is_test,
+        scopes: Vec::new(),
+        function_depth: 0,
+        next_sequence: 0,
+        evidence: crate::evidence::FrontendEvidence::default(),
+    };
+    collector.visit_file(syntax);
+    collector.evidence
+}
+
+#[derive(Clone, Debug, Default)]
+struct RustImports {
+    names: BTreeSet<String>,
+    aliases: BTreeSet<String>,
+}
+
+fn rust_imports(file: &syn::File) -> RustImports {
+    let mut imports = RustImports::default();
+    for item in &file.items {
+        collect_rust_import_item(item, &mut imports);
+    }
+    imports
+}
+
+fn collect_rust_import_item(item: &syn::Item, imports: &mut RustImports) {
+    match item {
+        syn::Item::Use(item) => collect_use_tree(&item.tree, imports),
+        syn::Item::Mod(module) => {
+            if let Some((_, items)) = &module.content {
+                for item in items {
+                    collect_rust_import_item(item, imports);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_use_tree(tree: &syn::UseTree, imports: &mut RustImports) {
+    match tree {
+        syn::UseTree::Path(path) => collect_use_tree(&path.tree, imports),
+        syn::UseTree::Name(name) => {
+            imports.names.insert(name.ident.to_string());
+        }
+        syn::UseTree::Rename(rename) => {
+            imports.aliases.insert(rename.rename.to_string());
+        }
+        syn::UseTree::Glob(_) => {}
+        syn::UseTree::Group(group) => {
+            for tree in &group.items {
+                collect_use_tree(tree, imports);
+            }
+        }
+    }
+}
+
+struct RustEvidenceCollector<'a> {
+    functions: &'a [FunctionReport],
+    imports: RustImports,
+    test_context: bool,
+    scopes: Vec<String>,
+    function_depth: usize,
+    next_sequence: usize,
+    evidence: crate::evidence::FrontendEvidence,
+}
+
+impl RustEvidenceCollector<'_> {
+    fn qualified_name(&self, leaf: &str) -> String {
+        let mut parts = self.scopes.clone();
+        parts.push(leaf.to_owned());
+        parts.join("::")
+    }
+
+    fn owner(
+        &self,
+        name: String,
+        kind: FunctionKind,
+        span: proc_macro2::Span,
+    ) -> Option<crate::evidence::LocalCallable> {
+        let end = span.end();
+        self.functions
+            .iter()
+            .find(|function| {
+                function.name == name
+                    && function.kind == kind
+                    && function.location.end.line == end.line
+                    && function.location.end.column == end.column + 1
+            })
+            .map(|function| crate::evidence::LocalCallable {
+                name: function.name.clone(),
+                kind: function.kind.clone(),
+                category: function.category,
+                location: function.location.clone(),
+            })
+            .or_else(|| {
+                self.functions
+                    .iter()
+                    .find(|function| function.name == name && function.kind == kind)
+                    .map(|function| crate::evidence::LocalCallable {
+                        name: function.name.clone(),
+                        kind: function.kind.clone(),
+                        category: function.category,
+                        location: function.location.clone(),
+                    })
+            })
+    }
+
+    fn collect_body(
+        &mut self,
+        owner: &crate::evidence::LocalCallable,
+        block: &syn::Block,
+        parameter_names: BTreeSet<String>,
+    ) {
+        let assignments = rust_bindings(block);
+        let mut sequence_collector = RustStatementCollector {
+            owner: owner.clone(),
+            next_sequence: &mut self.next_sequence,
+            statements: &mut self.evidence.statements,
+        };
+        sequence_collector.collect_block(block);
+        let mut calls = RustCallCollector {
+            owner: owner.clone(),
+            parameter_names,
+            assignments,
+            imports: &self.imports,
+            calls: &mut self.evidence.calls,
+        };
+        calls.visit_block(block);
+    }
+
+    fn collect_expression(
+        &mut self,
+        owner: &crate::evidence::LocalCallable,
+        expression: &Expr,
+        parameter_names: BTreeSet<String>,
+    ) {
+        let mut calls = RustCallCollector {
+            owner: owner.clone(),
+            parameter_names,
+            assignments: RustBindings::default(),
+            imports: &self.imports,
+            calls: &mut self.evidence.calls,
+        };
+        calls.visit_expr(expression);
+    }
+
+    fn parameter_names(signature: &syn::Signature) -> BTreeSet<String> {
+        signature
+            .inputs
+            .iter()
+            .filter_map(|input| match input {
+                FnArg::Typed(input) => pat_ident_name(&input.pat),
+                FnArg::Receiver(_) => None,
+            })
+            .collect()
+    }
+
+    fn closure_owner(&self, closure: &ExprClosure) -> Option<crate::evidence::LocalCallable> {
+        let start = closure.span().start();
+        let name = self.qualified_name(&format!("<closure@{}:{}>", start.line, start.column + 1));
+        self.owner(name, FunctionKind::Closure, closure.span())
+    }
+}
+
+impl<'ast> Visit<'ast> for RustEvidenceCollector<'_> {
+    fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+        let name = self.qualified_name(&node.sig.ident.to_string());
+        let kind = if self.function_depth > 0 {
+            FunctionKind::NestedFunction
+        } else {
+            FunctionKind::Function
+        };
+        if let Some(owner) = self.owner(name.clone(), kind, node.block.span()) {
+            self.collect_body(&owner, &node.block, Self::parameter_names(&node.sig));
+        }
+        let parent_test = self.test_context;
+        self.scopes.push(node.sig.ident.to_string());
+        self.function_depth += 1;
+        self.test_context = parent_test || has_test_only_attribute(&node.attrs);
+        visit::visit_item_fn(self, node);
+        self.test_context = parent_test;
+        self.function_depth -= 1;
+        self.scopes.pop();
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast ItemMod) {
+        if let Some((_, items)) = &node.content {
+            let parent_test = self.test_context;
+            self.test_context = parent_test || has_test_only_attribute(&node.attrs);
+            self.scopes.push(node.ident.to_string());
+            for item in items {
+                self.visit_item(item);
+            }
+            self.scopes.pop();
+            self.test_context = parent_test;
+        }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        let parent_test = self.test_context;
+        self.test_context = parent_test || has_test_only_attribute(&node.attrs);
+        self.scopes.push(type_name(&node.self_ty));
+        visit::visit_item_impl(self, node);
+        self.scopes.pop();
+        self.test_context = parent_test;
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        let name = self.qualified_name(&node.sig.ident.to_string());
+        if let Some(owner) = self.owner(name, FunctionKind::Method, node.block.span()) {
+            self.collect_body(&owner, &node.block, Self::parameter_names(&node.sig));
+        }
+        let parent_test = self.test_context;
+        self.test_context = parent_test || has_test_only_attribute(&node.attrs);
+        self.scopes.push(node.sig.ident.to_string());
+        self.function_depth += 1;
+        visit::visit_impl_item_fn(self, node);
+        self.function_depth -= 1;
+        self.scopes.pop();
+        self.test_context = parent_test;
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        let parent_test = self.test_context;
+        self.test_context = parent_test || has_test_only_attribute(&node.attrs);
+        self.scopes.push(node.ident.to_string());
+        visit::visit_item_trait(self, node);
+        self.scopes.pop();
+        self.test_context = parent_test;
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        if let Some(block) = &node.default {
+            let name = self.qualified_name(&node.sig.ident.to_string());
+            if let Some(owner) = self.owner(name, FunctionKind::TraitMethod, block.span()) {
+                self.collect_body(&owner, block, Self::parameter_names(&node.sig));
+            }
+        }
+        visit::visit_trait_item_fn(self, node);
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast ExprClosure) {
+        if let Some(owner) = self.closure_owner(node) {
+            let parameter_names = node
+                .inputs
+                .iter()
+                .filter_map(pat_ident_name)
+                .collect::<BTreeSet<_>>();
+            let body = match node.body.as_ref() {
+                Expr::Block(block) => &block.block,
+                expression => {
+                    self.collect_expression(&owner, expression, parameter_names);
+                    self.scopes.push(
+                        owner
+                            .name
+                            .rsplit("::")
+                            .next()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
+                    visit::visit_expr_closure(self, node);
+                    self.scopes.pop();
+                    return;
+                }
+            };
+            self.collect_body(&owner, body, parameter_names);
+            let label = owner
+                .name
+                .rsplit("::")
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            self.scopes.push(label);
+            visit::visit_expr_closure(self, node);
+            self.scopes.pop();
+        } else {
+            visit::visit_expr_closure(self, node);
+        }
+    }
+
+    fn visit_item_const(&mut self, node: &'ast ItemConst) {
+        let category = if self.test_context || has_test_only_attribute(&node.attrs) {
+            Category::Test
+        } else {
+            Category::Production
+        };
+        let name = self.qualified_name(&node.ident.to_string());
+        if let Some(owner) = self.owner(name, FunctionKind::ConstInitializer, node.span()) {
+            self.collect_expression(&owner, &node.expr, BTreeSet::new());
+        }
+        let _ = category;
+        visit::visit_item_const(self, node);
+    }
+
+    fn visit_item_static(&mut self, node: &'ast ItemStatic) {
+        let name = self.qualified_name(&node.ident.to_string());
+        if let Some(owner) = self.owner(name, FunctionKind::StaticInitializer, node.span()) {
+            self.collect_expression(&owner, &node.expr, BTreeSet::new());
+        }
+        visit::visit_item_static(self, node);
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RustBindings {
+    assignments: BTreeSet<String>,
+    aliases: BTreeSet<String>,
+}
+
+fn rust_bindings(block: &syn::Block) -> RustBindings {
+    let mut collector = RustBindingCollector::default();
+    collector.visit_block(block);
+    collector.bindings
+}
+
+#[derive(Default)]
+struct RustBindingCollector {
+    bindings: RustBindings,
+}
+
+impl<'ast> Visit<'ast> for RustBindingCollector {
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        let names = pat_ident_names(&node.pat);
+        if let Some(init) = &node.init {
+            if matches!(init.expr.as_ref(), Expr::Path(path) if path.path.segments.len() == 1) {
+                self.bindings.aliases.extend(names);
+            } else {
+                self.bindings.assignments.extend(names);
+            }
+        } else {
+            self.bindings.assignments.extend(names);
+        }
+        // Do not descend into nested callable bodies: their bindings belong
+        // to their own evidence unit.
+        if let Some(init) = &node.init {
+            self.visit_expr(&init.expr);
+        }
+    }
+
+    fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+
+    fn visit_expr_closure(&mut self, _node: &'ast ExprClosure) {}
+
+    fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
+        if let Expr::Path(path) = node.left.as_ref()
+            && path.path.segments.len() == 1
+        {
+            self.bindings.assignments.insert(
+                path.path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default(),
+            );
+        }
+        visit::visit_expr_assign(self, node);
+    }
+}
+
+fn pat_ident_name(pattern: &syn::Pat) -> Option<String> {
+    match pattern {
+        syn::Pat::Ident(pattern) => Some(pattern.ident.to_string()),
+        _ => None,
+    }
+}
+
+fn pat_ident_names(pattern: &syn::Pat) -> Vec<String> {
+    let mut collector = PatternNameCollector::default();
+    collector.visit_pat(pattern);
+    collector.names
+}
+
+#[derive(Default)]
+struct PatternNameCollector {
+    names: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for PatternNameCollector {
+    fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
+        self.names.push(node.ident.to_string());
+        visit::visit_pat_ident(self, node);
+    }
+}
+
+struct RustCallCollector<'a> {
+    owner: crate::evidence::LocalCallable,
+    parameter_names: BTreeSet<String>,
+    assignments: RustBindings,
+    imports: &'a RustImports,
+    calls: &'a mut Vec<crate::evidence::FrontendCall>,
+}
+
+impl RustCallCollector<'_> {
+    fn add(
+        &mut self,
+        name: String,
+        reason: crate::evidence::CallResolutionReason,
+        span: proc_macro2::Span,
+    ) {
+        let start = span.start();
+        let end = span.end();
+        self.calls.push(crate::evidence::FrontendCall {
+            caller: self.owner.clone(),
+            name,
+            reason,
+            location: Location {
+                start: Position {
+                    line: start.line,
+                    column: start.column + 1,
+                },
+                end: Position {
+                    line: end.line,
+                    column: end.column + 1,
+                },
+            },
+        });
+    }
+
+    fn direct_reason(&self, name: &str) -> crate::evidence::CallResolutionReason {
+        if self.parameter_names.contains(name) {
+            crate::evidence::CallResolutionReason::Parameter
+        } else if self.assignments.aliases.contains(name) {
+            crate::evidence::CallResolutionReason::Alias
+        } else if self.assignments.assignments.contains(name) {
+            crate::evidence::CallResolutionReason::Assignment
+        } else if self.imports.aliases.contains(name) {
+            crate::evidence::CallResolutionReason::Alias
+        } else if self.imports.names.contains(name) {
+            crate::evidence::CallResolutionReason::Import
+        } else {
+            crate::evidence::CallResolutionReason::DirectLocal
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for RustCallCollector<'_> {
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        match node.func.as_ref() {
+            Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 => {
+                let name = path
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                let reason = self.direct_reason(&name);
+                self.add(name, reason, node.span());
+            }
+            Expr::Path(_) => self.add(
+                node.func.to_token_stream().to_string(),
+                crate::evidence::CallResolutionReason::Qualified,
+                node.span(),
+            ),
+            Expr::MethodCall(_) => self.add(
+                node.func.to_token_stream().to_string(),
+                crate::evidence::CallResolutionReason::Method,
+                node.span(),
+            ),
+            _ => self.add(
+                node.func.to_token_stream().to_string(),
+                crate::evidence::CallResolutionReason::Dynamic,
+                node.span(),
+            ),
+        }
+        visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        self.add(
+            node.method.to_string(),
+            crate::evidence::CallResolutionReason::Method,
+            node.span(),
+        );
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+
+    fn visit_impl_item_fn(&mut self, _node: &'ast syn::ImplItemFn) {}
+
+    fn visit_trait_item_fn(&mut self, _node: &'ast syn::TraitItemFn) {}
+
+    fn visit_expr_closure(&mut self, _node: &'ast ExprClosure) {}
+}
+
+struct RustStatementCollector<'a> {
+    owner: crate::evidence::LocalCallable,
+    next_sequence: &'a mut usize,
+    statements: &'a mut Vec<crate::evidence::FrontendStatement>,
+}
+
+impl RustStatementCollector<'_> {
+    fn collect_block(&mut self, block: &syn::Block) {
+        let sequence = *self.next_sequence;
+        *self.next_sequence = self.next_sequence.saturating_add(1);
+        let mut ordinal = 0;
+        for statement in &block.stmts {
+            if matches!(statement, Stmt::Item(_)) {
+                continue;
+            }
+            let span = statement.span();
+            let start = span.start();
+            let end = span.end();
+            self.statements.push(crate::evidence::FrontendStatement {
+                caller: self.owner.clone(),
+                sequence,
+                ordinal,
+                location: Location {
+                    start: Position {
+                        line: start.line,
+                        column: start.column + 1,
+                    },
+                    end: Position {
+                        line: end.line,
+                        column: end.column + 1,
+                    },
+                },
+                tokens: rust_statement_tokens(statement),
+                scored_signals: rust_statement_signals(statement),
+            });
+            ordinal += 1;
+        }
+        for statement in &block.stmts {
+            if !matches!(statement, Stmt::Item(_)) {
+                self.visit_stmt(statement);
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for RustStatementCollector<'_> {
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        self.collect_block(node);
+    }
+
+    fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+
+    fn visit_impl_item_fn(&mut self, _node: &'ast syn::ImplItemFn) {}
+
+    fn visit_trait_item_fn(&mut self, _node: &'ast syn::TraitItemFn) {}
+
+    fn visit_expr_closure(&mut self, _node: &'ast ExprClosure) {}
+}
+
+fn rust_statement_tokens(statement: &Stmt) -> Vec<String> {
+    let stream = statement.to_token_stream();
+    let mut tokens = Vec::new();
+    fn flatten(stream: proc_macro2::TokenStream, tokens: &mut Vec<String>) {
+        for token in stream {
+            match token {
+                proc_macro2::TokenTree::Group(group) => {
+                    let (open, close) = match group.delimiter() {
+                        proc_macro2::Delimiter::Parenthesis => ("(", ")"),
+                        proc_macro2::Delimiter::Brace => ("{", "}"),
+                        proc_macro2::Delimiter::Bracket => ("[", "]"),
+                        proc_macro2::Delimiter::None => ("", ""),
+                    };
+                    if !open.is_empty() {
+                        tokens.push(open.to_owned());
+                    }
+                    flatten(group.stream(), tokens);
+                    if !close.is_empty() {
+                        tokens.push(close.to_owned());
+                    }
+                }
+                proc_macro2::TokenTree::Punct(punct) => tokens.push(punct.as_char().to_string()),
+                proc_macro2::TokenTree::Ident(ident) => tokens.push(ident.to_string()),
+                proc_macro2::TokenTree::Literal(literal) => tokens.push(literal.to_string()),
+            }
+        }
+    }
+    flatten(stream, &mut tokens);
+    tokens
+}
+
+#[derive(Default)]
+struct RustSignalCollector {
+    signals: usize,
+}
+
+impl<'ast> Visit<'ast> for RustSignalCollector {
+    fn visit_expr_binary(&mut self, node: &'ast ExprBinary) {
+        self.signals += 1;
+        visit::visit_expr_binary(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        self.signals += 1;
+        visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        self.signals += 1;
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast ExprIf) {
+        self.signals += 1;
+        visit::visit_expr_if(self, node);
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast ExprMatch) {
+        self.signals += 1;
+        visit::visit_expr_match(self, node);
+    }
+
+    fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+        self.signals += 1;
+        visit::visit_expr_loop(self, node);
+    }
+
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        self.signals += 1;
+        visit::visit_expr_for_loop(self, node);
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        self.signals += 1;
+        visit::visit_expr_while(self, node);
+    }
+
+    fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
+        self.signals += 1;
+        visit::visit_expr_assign(self, node);
+    }
+
+    fn visit_expr_index(&mut self, node: &'ast ExprIndex) {
+        self.signals += 1;
+        visit::visit_expr_index(self, node);
+    }
+
+    fn visit_expr_cast(&mut self, node: &'ast ExprCast) {
+        self.signals += 1;
+        visit::visit_expr_cast(self, node);
+    }
+
+    fn visit_expr_unary(&mut self, node: &'ast ExprUnary) {
+        self.signals += 1;
+        visit::visit_expr_unary(self, node);
+    }
+
+    fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+
+    fn visit_expr_closure(&mut self, _node: &'ast ExprClosure) {}
+}
+
+fn rust_statement_signals(statement: &Stmt) -> usize {
+    let mut collector = RustSignalCollector::default();
+    collector.visit_stmt(statement);
+    collector.signals
 }
 
 /// Resolve test-only external modules while preserving production reachability.
@@ -1442,6 +2127,7 @@ mod tests {
                 ..Coverage::default()
             },
             macro_opacity: MacroOpacity::default(),
+            evidence: crate::evidence::Evidence::current(),
             files: vec![file],
             errors: Vec::new(),
         }

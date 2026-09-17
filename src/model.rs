@@ -36,6 +36,10 @@ pub struct Report {
     pub summary: Summary,
     pub coverage: Coverage,
     pub macro_opacity: MacroOpacity,
+    /// Source-only relationships and duplicate statement evidence. Evidence
+    /// is serialized separately from the structural score and never changes
+    /// score values or burden aggregates.
+    pub evidence: crate::evidence::Evidence,
     pub files: Vec<FileReport>,
     pub errors: Vec<AnalysisError>,
 }
@@ -146,6 +150,9 @@ pub struct FileAnalysis {
     pub tokens: usize,
     pub functions: Vec<FunctionReport>,
     pub macro_opacity: MacroOpacity,
+    /// Frontend-owned evidence lowered from the source AST. The analyzer adds
+    /// file paths and combines it into [`Report::evidence`].
+    pub evidence: crate::evidence::FrontendEvidence,
 }
 
 /// Macro coverage that can be measured from the source currently on disk.
@@ -223,7 +230,7 @@ impl Language {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FunctionKind {
     Function,
@@ -255,13 +262,13 @@ impl FunctionKind {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct Location {
     pub start: Position,
     pub end: Position,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct Position {
     /// One-based source line.
     pub line: usize,

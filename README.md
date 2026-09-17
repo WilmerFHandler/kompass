@@ -308,6 +308,33 @@ totals come from lexing the complete file once, so they are not the sum of
 overlapping callable spans. Python input must be UTF-8 without a byte-order mark;
 unsupported encodings are reported as read errors and make coverage partial.
 
+## Source-only evidence
+
+JSON reports also contain `evidence` under the `evidence-v1` contract. Call
+coverage counts every syntactic call site, then separates unique direct local
+function matches from unresolved and ambiguous sites. Rust and Python frontends
+explicitly leave methods, qualified calls, imports, parameters, assignments,
+aliases, and dynamic callees unresolved because source text alone cannot prove
+which implementation will run. A call region follows only resolved local
+edges, includes each reachable callable once, sums its existing burden once,
+and reports the maximum acyclic depth, recursion, and traversal truncation.
+
+Duplicate groups are exact consecutive statement sequences within the same
+language and category. Comments, whitespace, and layout tokens are removed,
+while identifiers and literals remain part of the fingerprint, so similar
+looking code with renamed values does not become a match. Groups require at
+least three statements, forty counted tokens, and two scored operations,
+decisions, or calls. Nested callable bodies are kept in their own statement
+streams; contained groups are suppressed in favor of maximal groups. JSON
+retains every qualifying group, while text output renders a bounded prefix and
+shows the omitted count.
+
+Evidence is review context rather than a semantic proof. It does not expand
+macros, resolve types or imports, follow calls across files, infer aliases
+beyond the marked source patterns, or establish that two duplicate sequences
+have equivalent behavior. A complete report and a lower structural burden are
+still required before treating a refactor as a candidate for review.
+
 ## What gets analyzed
 
 At a Cargo manifest root Kompass asks Cargo for workspace packages, walks each

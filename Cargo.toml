@@ -12,6 +12,7 @@ ruff_python_ast = "=0.0.10"
 ruff_python_parser = "=0.0.10"
 ruff_source_file = "=0.0.10"
 ruff_text_size = "=0.0.10"
+quote = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 syn = { version = "2.0", features = ["full", "visit"] }

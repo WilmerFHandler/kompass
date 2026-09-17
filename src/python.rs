@@ -60,18 +60,597 @@ pub fn analyze_file(
         functions: Vec::new(),
     };
     collector.collect_module(module);
+    let functions = collector.functions;
+    let evidence = extract_python_evidence(source, parsed.tokens(), module, &functions);
 
     Ok(FileAnalysis {
         lines: line_map.counts.clone(),
         tokens: token_index.total(),
-        functions: collector.functions,
+        functions,
         macro_opacity: MacroOpacity::default(),
+        evidence,
     })
 }
 
 /// Convenience wrapper for callers that do not have a path.
 pub fn analyze(source: &str, category: Category) -> Result<FileAnalysis, String> {
     analyze_file(Path::new("<python>"), source, category)
+}
+
+/// Lower source-only call and statement facts beside the Ruff AST collector.
+/// Name resolution remains intentionally conservative: only a unique direct
+/// local function name can become a resolved edge in the common evidence
+/// builder.
+fn extract_python_evidence(
+    source: &str,
+    tokens: &Tokens,
+    module: &ModModule,
+    functions: &[FunctionReport],
+) -> crate::evidence::FrontendEvidence {
+    let line_map = LineMap::new(source, tokens);
+    let imports = python_imports(module);
+    let mut collector = PythonEvidenceCollector {
+        source,
+        tokens,
+        line_map: &line_map,
+        functions,
+        imports,
+        scopes: Vec::new(),
+        function_depth: 0,
+        class_depth: 0,
+        next_sequence: 0,
+        evidence: crate::evidence::FrontendEvidence::default(),
+    };
+    let module_owner = collector.owner(
+        collector.qualified_name("<module>"),
+        FunctionKind::ModuleInitializer,
+        TextRange::new(TextSize::new(0), text_size(source.len())),
+    );
+    if let Some(owner) = module_owner {
+        collector.collect_body(&owner, &module.body, std::collections::BTreeSet::new());
+    }
+    collector.visit_body(&module.body);
+    collector.evidence
+}
+
+#[derive(Clone, Debug, Default)]
+struct PythonImports {
+    names: std::collections::BTreeSet<String>,
+    aliases: std::collections::BTreeSet<String>,
+}
+
+fn python_imports(module: &ModModule) -> PythonImports {
+    let mut collector = PythonImportCollector::default();
+    collector.visit_body(&module.body);
+    collector.imports
+}
+
+#[derive(Default)]
+struct PythonImportCollector {
+    imports: PythonImports,
+}
+
+impl<'ast> Visitor<'ast> for PythonImportCollector {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        match statement {
+            Stmt::Import(node) => {
+                for alias in &node.names {
+                    if let Some(asname) = &alias.asname {
+                        self.imports.aliases.insert(asname.as_str().to_owned());
+                    } else {
+                        self.imports.names.insert(
+                            alias
+                                .name
+                                .as_str()
+                                .split('.')
+                                .next()
+                                .unwrap_or_default()
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+            Stmt::ImportFrom(node) => {
+                for alias in &node.names {
+                    if alias.name.as_str() == "*" {
+                        continue;
+                    }
+                    if let Some(asname) = &alias.asname {
+                        self.imports.aliases.insert(asname.as_str().to_owned());
+                    } else {
+                        self.imports.names.insert(alias.name.as_str().to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+        visitor::walk_stmt(self, statement);
+    }
+}
+
+struct PythonEvidenceCollector<'a> {
+    source: &'a str,
+    tokens: &'a Tokens,
+    line_map: &'a LineMap,
+    functions: &'a [FunctionReport],
+    imports: PythonImports,
+    scopes: Vec<String>,
+    function_depth: usize,
+    class_depth: usize,
+    next_sequence: usize,
+    evidence: crate::evidence::FrontendEvidence,
+}
+
+impl PythonEvidenceCollector<'_> {
+    fn qualified_name(&self, leaf: &str) -> String {
+        let mut parts = self.scopes.clone();
+        parts.push(leaf.to_owned());
+        if parts.is_empty() {
+            leaf.to_owned()
+        } else {
+            parts.join("::")
+        }
+    }
+
+    fn owner(
+        &self,
+        name: String,
+        kind: FunctionKind,
+        range: TextRange,
+    ) -> Option<crate::evidence::LocalCallable> {
+        let start = self.line_map.position(range.start());
+        let end = self.line_map.end_position(range.end());
+        self.functions
+            .iter()
+            .find(|function| {
+                function.name == name
+                    && function.kind == kind
+                    && function.location.start == start
+                    && function.location.end == end
+            })
+            .or_else(|| {
+                self.functions
+                    .iter()
+                    .find(|function| function.name == name && function.kind == kind)
+            })
+            .map(|function| crate::evidence::LocalCallable {
+                name: function.name.clone(),
+                kind: function.kind.clone(),
+                category: function.category,
+                location: function.location.clone(),
+            })
+    }
+
+    fn collect_body(
+        &mut self,
+        owner: &crate::evidence::LocalCallable,
+        body: &[Stmt],
+        parameter_names: std::collections::BTreeSet<String>,
+    ) {
+        let mut statements = PythonStatementCollector {
+            owner: owner.clone(),
+            source: self.source,
+            tokens: self.tokens,
+            line_map: self.line_map,
+            next_sequence: &mut self.next_sequence,
+            statements: &mut self.evidence.statements,
+        };
+        statements.collect_body(body);
+        let bindings = python_bindings(body);
+        let mut calls = PythonCallCollector {
+            owner: owner.clone(),
+            line_map: self.line_map,
+            parameter_names,
+            bindings,
+            imports: &self.imports,
+            calls: &mut self.evidence.calls,
+        };
+        calls.visit_body(body);
+    }
+
+    fn collect_lambda(&mut self, node: &ExprLambda) {
+        let start = self.line_map.position(node.range.start());
+        let label = format!("<lambda@{}:{}>", start.line, start.column);
+        let name = self.qualified_name(&label);
+        let Some(owner) = self.owner(name, FunctionKind::Lambda, node.range) else {
+            return;
+        };
+        let parameter_names = node
+            .parameters
+            .as_deref()
+            .map(|parameters| {
+                parameters
+                    .iter()
+                    .map(|parameter| parameter.name().to_string())
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let mut calls = PythonCallCollector {
+            owner: owner.clone(),
+            line_map: self.line_map,
+            parameter_names,
+            bindings: PythonBindings::default(),
+            imports: &self.imports,
+            calls: &mut self.evidence.calls,
+        };
+        calls.visit_expr(&node.body);
+        let mut statements = PythonStatementCollector {
+            owner: owner.clone(),
+            source: self.source,
+            tokens: self.tokens,
+            line_map: self.line_map,
+            next_sequence: &mut self.next_sequence,
+            statements: &mut self.evidence.statements,
+        };
+        statements.collect_expression(&node.body);
+    }
+}
+
+impl<'ast> Visitor<'ast> for PythonEvidenceCollector<'_> {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        match statement {
+            Stmt::FunctionDef(node) => {
+                let kind = if self.function_depth > 0 {
+                    FunctionKind::NestedFunction
+                } else if self.class_depth > 0 {
+                    FunctionKind::Method
+                } else {
+                    FunctionKind::Function
+                };
+                let name = self.qualified_name(node.name.as_str());
+                if let Some(owner) = self.owner(name, kind, node.range) {
+                    let parameters = node
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.name().to_string())
+                        .collect();
+                    self.collect_body(&owner, &node.body, parameters);
+                }
+                self.scopes.push(node.name.as_str().to_owned());
+                self.function_depth += 1;
+                for statement in &node.body {
+                    self.visit_stmt(statement);
+                }
+                self.function_depth -= 1;
+                self.scopes.pop();
+            }
+            Stmt::ClassDef(node) => {
+                let name = self.qualified_name("<class>");
+                if let Some(owner) = self.owner(name, FunctionKind::ClassInitializer, node.range) {
+                    self.collect_body(&owner, &node.body, std::collections::BTreeSet::new());
+                }
+                self.scopes.push(node.name.as_str().to_owned());
+                self.class_depth += 1;
+                for statement in &node.body {
+                    self.visit_stmt(statement);
+                }
+                self.class_depth -= 1;
+                self.scopes.pop();
+            }
+            _ => visitor::walk_stmt(self, statement),
+        }
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if let Expr::Lambda(node) = expression {
+            self.collect_lambda(node);
+            if let Some(parameters) = &node.parameters {
+                for parameter in parameters {
+                    if let Some(default) = parameter.default() {
+                        self.visit_expr(default);
+                    }
+                }
+            }
+            self.scopes.push(format!(
+                "<lambda@{}:{}>",
+                self.line_map.position(node.range.start()).line,
+                self.line_map.position(node.range.start()).column
+            ));
+            self.visit_expr(&node.body);
+            self.scopes.pop();
+        } else {
+            visitor::walk_expr(self, expression);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct PythonBindings {
+    assignments: std::collections::BTreeSet<String>,
+    aliases: std::collections::BTreeSet<String>,
+}
+
+fn python_bindings(body: &[Stmt]) -> PythonBindings {
+    let mut collector = PythonBindingCollector::default();
+    collector.visit_body(body);
+    collector.bindings
+}
+
+#[derive(Default)]
+struct PythonBindingCollector {
+    bindings: PythonBindings,
+}
+
+impl<'ast> Visitor<'ast> for PythonBindingCollector {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        match statement {
+            Stmt::Assign(node) => {
+                let names = node
+                    .targets
+                    .iter()
+                    .flat_map(python_target_names)
+                    .collect::<Vec<_>>();
+                if matches!(node.value.as_ref(), Expr::Name(_)) {
+                    self.bindings.aliases.extend(names);
+                } else {
+                    self.bindings.assignments.extend(names);
+                }
+            }
+            Stmt::AnnAssign(node) => {
+                self.bindings
+                    .assignments
+                    .extend(python_target_names(&node.target));
+            }
+            Stmt::AugAssign(node) => {
+                self.bindings
+                    .assignments
+                    .extend(python_target_names(&node.target));
+            }
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => return,
+            _ => {}
+        }
+        visitor::walk_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if let Expr::Named(node) = expression {
+            self.bindings
+                .assignments
+                .extend(python_target_names(&node.target));
+            visitor::walk_expr(self, expression);
+        } else if !matches!(expression, Expr::Lambda(_)) {
+            visitor::walk_expr(self, expression);
+        }
+    }
+}
+
+fn python_target_names(expression: &Expr) -> Vec<String> {
+    match expression {
+        Expr::Name(name) => vec![name.id.as_str().to_owned()],
+        Expr::Tuple(tuple) => tuple.elts.iter().flat_map(python_target_names).collect(),
+        Expr::List(list) => list.elts.iter().flat_map(python_target_names).collect(),
+        _ => Vec::new(),
+    }
+}
+
+struct PythonCallCollector<'a> {
+    owner: crate::evidence::LocalCallable,
+    line_map: &'a LineMap,
+    parameter_names: std::collections::BTreeSet<String>,
+    bindings: PythonBindings,
+    imports: &'a PythonImports,
+    calls: &'a mut Vec<crate::evidence::FrontendCall>,
+}
+
+impl PythonCallCollector<'_> {
+    fn add(
+        &mut self,
+        name: String,
+        reason: crate::evidence::CallResolutionReason,
+        range: TextRange,
+    ) {
+        self.calls.push(crate::evidence::FrontendCall {
+            caller: self.owner.clone(),
+            name,
+            reason,
+            location: Location {
+                start: self.line_map.position(range.start()),
+                end: self.line_map.end_position(range.end()),
+            },
+        });
+    }
+
+    fn direct_reason(&self, name: &str) -> crate::evidence::CallResolutionReason {
+        if self.parameter_names.contains(name) {
+            crate::evidence::CallResolutionReason::Parameter
+        } else if self.bindings.aliases.contains(name) {
+            crate::evidence::CallResolutionReason::Alias
+        } else if self.bindings.assignments.contains(name) {
+            crate::evidence::CallResolutionReason::Assignment
+        } else if self.imports.aliases.contains(name) {
+            crate::evidence::CallResolutionReason::Alias
+        } else if self.imports.names.contains(name) {
+            crate::evidence::CallResolutionReason::Import
+        } else {
+            crate::evidence::CallResolutionReason::DirectLocal
+        }
+    }
+}
+
+impl<'ast> Visitor<'ast> for PythonCallCollector<'_> {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+            return;
+        }
+        visitor::walk_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        match expression {
+            Expr::Call(node) => {
+                let (name, reason) = match node.func.as_ref() {
+                    Expr::Name(name) => {
+                        let name = name.id.as_str().to_owned();
+                        let reason = self.direct_reason(&name);
+                        (name, reason)
+                    }
+                    Expr::Attribute(attribute) => (
+                        attribute.attr.as_str().to_owned(),
+                        crate::evidence::CallResolutionReason::Method,
+                    ),
+                    _ => (
+                        "<dynamic>".to_owned(),
+                        crate::evidence::CallResolutionReason::Dynamic,
+                    ),
+                };
+                self.add(name, reason, node.range());
+                visitor::walk_expr(self, expression);
+            }
+            Expr::Lambda(_) => {}
+            _ => visitor::walk_expr(self, expression),
+        }
+    }
+}
+
+struct PythonStatementCollector<'a> {
+    owner: crate::evidence::LocalCallable,
+    source: &'a str,
+    tokens: &'a Tokens,
+    line_map: &'a LineMap,
+    next_sequence: &'a mut usize,
+    statements: &'a mut Vec<crate::evidence::FrontendStatement>,
+}
+
+impl PythonStatementCollector<'_> {
+    fn collect_body(&mut self, body: &[Stmt]) {
+        let sequence = *self.next_sequence;
+        *self.next_sequence = self.next_sequence.saturating_add(1);
+        let mut ordinal = 0;
+        for statement in body {
+            if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                continue;
+            }
+            let range = statement.range();
+            self.statements.push(crate::evidence::FrontendStatement {
+                caller: self.owner.clone(),
+                sequence,
+                ordinal,
+                location: self.location(range),
+                tokens: python_statement_tokens(self.source, self.tokens, range),
+                scored_signals: python_statement_signals(statement),
+            });
+            ordinal += 1;
+        }
+        for statement in body {
+            if !matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                self.visit_stmt(statement);
+            }
+        }
+    }
+
+    fn collect_expression(&mut self, expression: &Expr) {
+        let sequence = *self.next_sequence;
+        *self.next_sequence = self.next_sequence.saturating_add(1);
+        self.statements.push(crate::evidence::FrontendStatement {
+            caller: self.owner.clone(),
+            sequence,
+            ordinal: 0,
+            location: self.location(expression.range()),
+            tokens: python_statement_tokens(self.source, self.tokens, expression.range()),
+            scored_signals: python_expression_signals(expression),
+        });
+    }
+
+    fn location(&self, range: TextRange) -> Location {
+        Location {
+            start: self.line_map.position(range.start()),
+            end: self.line_map.end_position(range.end()),
+        }
+    }
+}
+
+impl<'ast> Visitor<'ast> for PythonStatementCollector<'_> {
+    fn visit_body(&mut self, body: &'ast [Stmt]) {
+        self.collect_body(body);
+    }
+
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+            return;
+        }
+        visitor::walk_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if !matches!(expression, Expr::Lambda(_)) {
+            visitor::walk_expr(self, expression);
+        }
+    }
+}
+
+fn python_statement_tokens(source: &str, tokens: &Tokens, range: TextRange) -> Vec<String> {
+    tokens
+        .iter()
+        .filter(|token| {
+            let token_range = token.range();
+            token_range.start() >= range.start()
+                && token_range.end() <= range.end()
+                && is_counted_token(token.kind())
+        })
+        .filter_map(|token| {
+            let token_range = token.range();
+            source
+                .get(token_range.start().to_usize()..token_range.end().to_usize())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct PythonSignalCollector {
+    signals: usize,
+}
+
+impl<'ast> Visitor<'ast> for PythonSignalCollector {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        match statement {
+            Stmt::If(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_) | Stmt::Try(_) => {
+                self.signals += 1
+            }
+            Stmt::Assign(_) | Stmt::AugAssign(_) | Stmt::AnnAssign(_) | Stmt::TypeAlias(_) => {
+                self.signals += 1
+            }
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => return,
+            _ => {}
+        }
+        visitor::walk_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        match expression {
+            Expr::BoolOp(node) => {
+                self.signals += node.values.len().saturating_sub(1);
+            }
+            Expr::BinOp(_)
+            | Expr::UnaryOp(_)
+            | Expr::Compare(_)
+            | Expr::Call(_)
+            | Expr::Subscript(_)
+            | Expr::Await(_)
+            | Expr::Yield(_)
+            | Expr::YieldFrom(_)
+            | Expr::If(_) => self.signals += 1,
+            Expr::Lambda(_) => return,
+            Expr::ListComp(node) => self.signals += node.generators.len(),
+            Expr::SetComp(node) => self.signals += node.generators.len(),
+            Expr::DictComp(node) => self.signals += node.generators.len(),
+            Expr::Generator(node) => self.signals += node.generators.len(),
+            _ => {}
+        }
+        visitor::walk_expr(self, expression);
+    }
+}
+
+fn python_statement_signals(statement: &Stmt) -> usize {
+    let mut collector = PythonSignalCollector::default();
+    collector.visit_stmt(statement);
+    collector.signals
+}
+
+fn python_expression_signals(expression: &Expr) -> usize {
+    let mut collector = PythonSignalCollector::default();
+    collector.visit_expr(expression);
+    collector.signals
 }
 
 fn format_parse_errors(parsed: &ruff_python_parser::Parsed<Mod>) -> String {

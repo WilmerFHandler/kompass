@@ -252,6 +252,7 @@ fn render_text(report: &Report, top: usize, tests: bool, all: bool, sort: SortBy
         report.macro_opacity.definition_tokens
     )
     .unwrap();
+    render_evidence_summary(&mut output, report);
     render_file_burdens(&mut output, report, top);
 
     if report.coverage.complete {
@@ -340,6 +341,45 @@ fn render_text(report: &Report, top: usize, tests: bool, all: bool, sort: SortBy
     }
 
     output
+}
+
+fn render_evidence_summary(output: &mut String, report: &Report) {
+    let coverage = &report.evidence.call_graph.coverage;
+    writeln!(
+        output,
+        "Call evidence · {} call sites · {} resolved · {} unresolved · {} ambiguous · {:.0}% resolved",
+        coverage.call_sites,
+        coverage.resolved,
+        coverage.unresolved,
+        coverage.ambiguous,
+        coverage.resolved_ratio * 100.0
+    )
+    .unwrap();
+    let groups = &report.evidence.duplicates.groups;
+    let shown = groups
+        .len()
+        .min(crate::evidence::DEFAULT_DUPLICATE_RENDER_LIMIT);
+    let omitted = groups.len().saturating_sub(shown);
+    writeln!(
+        output,
+        "Duplicate evidence · {} exact groups · showing {} · {} omitted · identifiers and literals preserved",
+        groups.len(),
+        shown,
+        omitted
+    )
+    .unwrap();
+    for group in groups.iter().take(shown) {
+        writeln!(
+            output,
+            "  {} {} statements · {} tokens · {} occurrences · {}",
+            group.language.label(),
+            group.statement_count,
+            group.tokens,
+            group.occurrences.len(),
+            group.fingerprint
+        )
+        .unwrap();
+    }
 }
 
 fn effective_language_counts(report: &Report) -> LanguageCounts {
@@ -571,6 +611,7 @@ mod tests {
                 ..Coverage::default()
             },
             macro_opacity: MacroOpacity::default(),
+            evidence: crate::evidence::Evidence::current(),
             files: vec![FileReport {
                 path: "src/lib.rs".to_owned(),
                 language: Language::Rust,
@@ -684,6 +725,7 @@ mod tests {
                 ..Coverage::default()
             },
             macro_opacity: MacroOpacity::default(),
+            evidence: crate::evidence::Evidence::current(),
             files: vec![
                 FileReport {
                     path: "z.rs".to_owned(),
