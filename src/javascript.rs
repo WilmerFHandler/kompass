@@ -466,12 +466,12 @@ impl<'ast> VisitJs<'ast> for MetricsCollector {
     fn visit_declaration(&mut self, declaration: &Declaration<'ast>) {
         match declaration {
             Declaration::VariableDeclaration(node) => self.visit_variable_declaration(node),
+            Declaration::TSEnumDeclaration(node) => self.visit_ts_enum_declaration(node),
+            Declaration::TSModuleDeclaration(node) => self.visit_ts_module_declaration(node),
             Declaration::FunctionDeclaration(_)
             | Declaration::ClassDeclaration(_)
             | Declaration::TSTypeAliasDeclaration(_)
             | Declaration::TSInterfaceDeclaration(_)
-            | Declaration::TSEnumDeclaration(_)
-            | Declaration::TSModuleDeclaration(_)
             | Declaration::TSGlobalDeclaration(_)
             | Declaration::TSImportEqualsDeclaration(_) => {}
         }
@@ -498,7 +498,8 @@ impl<'ast> VisitJs<'ast> for MetricsCollector {
                 | Statement::DebuggerStatement(_)
                 | Statement::LabeledStatement(_)
                 | Statement::ExportDeclaration(_)
-        );
+        ) || matches!(statement, Statement::TSEnumDeclaration(node) if ts_enum_emits_runtime(node))
+            || matches!(statement, Statement::TSModuleDeclaration(node) if ts_module_emits_runtime(node));
         if executable {
             self.metrics.statements += 1;
         }
@@ -519,6 +520,8 @@ impl<'ast> VisitJs<'ast> for MetricsCollector {
             Statement::ThrowStatement(node) => self.visit_expression(&node.argument),
             Statement::LabeledStatement(node) => self.visit_statement(&node.body),
             Statement::VariableDeclaration(node) => self.visit_variable_declaration(node),
+            Statement::TSEnumDeclaration(node) => self.visit_ts_enum_declaration(node),
+            Statement::TSModuleDeclaration(node) => self.visit_ts_module_declaration(node),
             Statement::FunctionDeclaration(_)
             | Statement::ClassDeclaration(_)
             | Statement::ImportDeclaration(_)
@@ -528,8 +531,6 @@ impl<'ast> VisitJs<'ast> for MetricsCollector {
             | Statement::ExportAllDeclaration(_)
             | Statement::TSTypeAliasDeclaration(_)
             | Statement::TSInterfaceDeclaration(_)
-            | Statement::TSEnumDeclaration(_)
-            | Statement::TSModuleDeclaration(_)
             | Statement::TSGlobalDeclaration(_)
             | Statement::TSImportEqualsDeclaration(_)
             | Statement::EmptyStatement(_)
@@ -549,6 +550,33 @@ impl<'ast> VisitJs<'ast> for MetricsCollector {
             if let Some(init) = &declarator.init {
                 self.visit_expression(init);
             }
+        }
+    }
+
+    fn visit_ts_enum_declaration(&mut self, declaration: &TSEnumDeclaration<'ast>) {
+        if !ts_enum_emits_runtime(declaration) {
+            return;
+        }
+        self.metrics.statements += declaration.body.members.len();
+        for member in &declaration.body.members {
+            if let Some(initializer) = &member.initializer {
+                self.visit_expression(initializer);
+            }
+        }
+    }
+
+    fn visit_ts_module_declaration(&mut self, declaration: &TSModuleDeclaration<'ast>) {
+        if !ts_module_emits_runtime(declaration) {
+            return;
+        }
+        match declaration.body.as_ref() {
+            Some(TSModuleDeclarationBody::TSModuleBlock(block)) => {
+                self.visit_statements(&block.body);
+            }
+            Some(TSModuleDeclarationBody::TSModuleDeclaration(nested)) => {
+                self.visit_ts_module_declaration(nested.as_ref());
+            }
+            None => {}
         }
     }
 
@@ -915,6 +943,20 @@ impl DiscoveryWalker<'_> {
         }
     }
 
+    fn measure_parameter_initializers(
+        &self,
+        parameters: &FormalParameters<'_>,
+        metrics: &mut Metrics,
+        pending: &mut Vec<PendingContribution>,
+        depth: usize,
+    ) {
+        for parameter in &parameters.items {
+            if let Some(initializer) = &parameter.initializer {
+                measure_into(initializer, metrics, pending, self.line_map, depth);
+            }
+        }
+    }
+
     fn collect_function(
         &mut self,
         function: &Function<'_>,
@@ -935,6 +977,12 @@ impl DiscoveryWalker<'_> {
             parameters,
         );
         Self::parameter_contributions(&function.params, &mut pending);
+        self.measure_parameter_initializers(
+            &function.params,
+            &mut metrics,
+            &mut pending,
+            base_depth,
+        );
         metrics.parameters = parameters;
         metrics.explicit_parameters = parameters;
         let local_name = hint
@@ -990,6 +1038,7 @@ impl DiscoveryWalker<'_> {
             ),
         };
         Self::parameter_contributions(&arrow.params, &mut pending);
+        self.measure_parameter_initializers(&arrow.params, &mut metrics, &mut pending, self.depth);
         metrics.parameters = parameters;
         metrics.explicit_parameters = parameters;
         let local_name = hint
@@ -1022,6 +1071,11 @@ impl DiscoveryWalker<'_> {
             in_function: true,
             functions: &mut *self.functions,
         };
+        for parameter in &arrow.params.items {
+            if let Some(initializer) = &parameter.initializer {
+                nested.visit_expression(initializer);
+            }
+        }
         match &arrow.body {
             ArrowFunctionBody::FunctionBody(body) => nested.visit_body(&body.statements),
             _ => nested.visit_expression(arrow.body.to_expression()),
@@ -1079,7 +1133,6 @@ impl DiscoveryWalker<'_> {
                     &mut pending,
                 ),
                 ClassElement::StaticBlock(block) => {
-                    metrics.statements += block.body.len();
                     let (block_metrics, block_pending) = metrics_for_statements(
                         &block.body,
                         self.line_map,
@@ -1149,7 +1202,6 @@ impl DiscoveryWalker<'_> {
             self.visit_expression(&decorator.expression);
         }
         if let Some(value) = value {
-            metrics.statements += 1;
             measure_into(value, metrics, pending, self.line_map, self.depth);
         }
     }
@@ -1165,6 +1217,7 @@ impl DiscoveryWalker<'_> {
         let (mut metrics, mut pending) =
             metrics_for_statements(&body.statements, self.line_map, full, 0, parameters);
         Self::parameter_contributions(&method.value.params, &mut pending);
+        self.measure_parameter_initializers(&method.value.params, &mut metrics, &mut pending, 0);
         metrics.parameters = parameters;
         metrics.explicit_parameters = parameters;
         self.add_report(
@@ -1191,6 +1244,21 @@ impl DiscoveryWalker<'_> {
         };
         nested.visit_body(&body.statements);
     }
+
+    fn visit_runtime_ts_module(&mut self, declaration: &TSModuleDeclaration<'_>) {
+        if !ts_module_emits_runtime(declaration) {
+            return;
+        }
+        self.scope.push(ts_module_name(declaration));
+        match declaration.body.as_ref() {
+            Some(TSModuleDeclarationBody::TSModuleBlock(block)) => self.visit_body(&block.body),
+            Some(TSModuleDeclarationBody::TSModuleDeclaration(nested)) => {
+                self.visit_runtime_ts_module(nested.as_ref());
+            }
+            None => {}
+        }
+        self.scope.pop();
+    }
 }
 
 /// A module containing only callable declarations has no separate
@@ -1207,21 +1275,19 @@ fn module_statement_has_runtime_work(statement: &Statement<'_>) -> bool {
         | Statement::ExportAllDeclaration(_)
         | Statement::TSTypeAliasDeclaration(_)
         | Statement::TSInterfaceDeclaration(_)
-        | Statement::TSEnumDeclaration(_)
-        | Statement::TSModuleDeclaration(_)
         | Statement::TSGlobalDeclaration(_)
         | Statement::TSImportEqualsDeclaration(_)
         | Statement::EmptyStatement(_) => false,
+        Statement::TSEnumDeclaration(declaration) => ts_enum_emits_runtime(declaration),
+        Statement::TSModuleDeclaration(declaration) => ts_module_emits_runtime(declaration),
         Statement::VariableDeclaration(declaration) => {
             variable_declaration_has_runtime_work(declaration)
         }
         Statement::ExportDeclaration(export) => declaration_has_runtime_work(&export.declaration),
-        Statement::ExportDefaultDeclaration(export) => !matches!(
-            &export.declaration,
-            ExportDefaultDeclarationKind::FunctionDeclaration(_)
-                | ExportDefaultDeclarationKind::ClassDeclaration(_)
-                | ExportDefaultDeclarationKind::TSInterfaceDeclaration(_)
-        ),
+        Statement::ExportDefaultDeclaration(export) => export
+            .declaration
+            .as_expression()
+            .is_some_and(|expression| !is_callable_initializer(expression)),
         _ => true,
     }
 }
@@ -1231,14 +1297,29 @@ fn declaration_has_runtime_work(declaration: &Declaration<'_>) -> bool {
         Declaration::VariableDeclaration(declaration) => {
             variable_declaration_has_runtime_work(declaration)
         }
+        Declaration::TSEnumDeclaration(declaration) => ts_enum_emits_runtime(declaration),
+        Declaration::TSModuleDeclaration(declaration) => ts_module_emits_runtime(declaration),
         Declaration::FunctionDeclaration(_)
         | Declaration::ClassDeclaration(_)
         | Declaration::TSTypeAliasDeclaration(_)
         | Declaration::TSInterfaceDeclaration(_)
-        | Declaration::TSEnumDeclaration(_)
-        | Declaration::TSModuleDeclaration(_)
         | Declaration::TSGlobalDeclaration(_)
         | Declaration::TSImportEqualsDeclaration(_) => false,
+    }
+}
+
+fn ts_enum_emits_runtime(declaration: &TSEnumDeclaration<'_>) -> bool {
+    !declaration.r#const && !declaration.declare
+}
+
+fn ts_module_emits_runtime(declaration: &TSModuleDeclaration<'_>) -> bool {
+    !declaration.declare && matches!(declaration.id, TSModuleDeclarationName::Identifier(_))
+}
+
+fn ts_module_name(declaration: &TSModuleDeclaration<'_>) -> String {
+    match &declaration.id {
+        TSModuleDeclarationName::Identifier(identifier) => identifier.name.to_string(),
+        TSModuleDeclarationName::StringLiteral(literal) => literal.value.to_string(),
     }
 }
 
@@ -1379,6 +1460,15 @@ mod tests {
             .find(|function| function.name == "Counter::increment")
             .expect("method should be reported");
         assert_eq!(initializer.metrics.call_sites, 2);
+        assert_eq!(initializer.metrics.statements, 2);
+        assert_eq!(
+            file.evidence
+                .calls
+                .iter()
+                .filter(|call| call.caller.kind == FunctionKind::ClassInitializer)
+                .count(),
+            2
+        );
         assert_eq!(method.metrics.control_decisions, 1);
         assert_eq!(
             file.functions
@@ -1387,6 +1477,70 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn runtime_typescript_declarations_remain_visible() {
+        let file = analyze(
+            "enum Status { Ready = initialize(), Done }\nnamespace Runtime { export const ready = configure(); export function run() { return ready; } }\nconst enum Erased { Value }\ndeclare namespace Types { const value: string; }\n",
+            SourceMode::TypeScript,
+        );
+        let module = file
+            .functions
+            .iter()
+            .find(|function| function.kind == FunctionKind::ModuleInitializer)
+            .expect("runtime TypeScript declarations should initialize the module");
+        assert_eq!(module.metrics.call_sites, 2);
+        assert!(
+            file.functions
+                .iter()
+                .any(|function| function.name == "Runtime::run")
+        );
+        assert_eq!(
+            file.evidence
+                .calls
+                .iter()
+                .filter(|call| call.caller.kind == FunctionKind::ModuleInitializer)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn parameter_defaults_belong_to_the_callable() {
+        let file = analyze(
+            "function choose(value = initialize(), ready = flag ? left() : right()) { return value; }",
+            SourceMode::JavaScript,
+        );
+        let function = file
+            .functions
+            .iter()
+            .find(|function| function.name == "choose")
+            .expect("function should be reported");
+        assert_eq!(function.metrics.call_sites, 3);
+        assert_eq!(function.metrics.control_decisions, 1);
+        assert!(
+            !file
+                .functions
+                .iter()
+                .any(|function| function.kind == FunctionKind::ModuleInitializer)
+        );
+        assert_eq!(
+            file.evidence
+                .calls
+                .iter()
+                .filter(|call| call.caller.name == "choose")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn default_exported_callable_has_no_empty_module_unit() {
+        let file = analyze("export default () => value?.child;", SourceMode::JavaScript);
+        assert_eq!(file.functions.len(), 1);
+        assert_eq!(file.functions[0].kind, FunctionKind::Closure);
+        assert_eq!(file.functions[0].metrics.boolean_operators, 1);
     }
 
     #[test]
@@ -1570,6 +1724,9 @@ impl<'ast> VisitJs<'ast> for DiscoveryWalker<'_> {
             Statement::VariableDeclaration(declaration) => {
                 self.visit_variable_declaration(declaration)
             }
+            Statement::TSModuleDeclaration(declaration) => {
+                self.visit_runtime_ts_module(declaration)
+            }
             Statement::ExportDeclaration(node) => self.visit_declaration(&node.declaration),
             Statement::ExportDefaultDeclaration(node) => {
                 self.visit_export_default_declaration(node);
@@ -1581,7 +1738,6 @@ impl<'ast> VisitJs<'ast> for DiscoveryWalker<'_> {
             | Statement::TSTypeAliasDeclaration(_)
             | Statement::TSInterfaceDeclaration(_)
             | Statement::TSEnumDeclaration(_)
-            | Statement::TSModuleDeclaration(_)
             | Statement::TSGlobalDeclaration(_)
             | Statement::TSImportEqualsDeclaration(_)
             | Statement::EmptyStatement(_)
@@ -1606,10 +1762,12 @@ impl<'ast> VisitJs<'ast> for DiscoveryWalker<'_> {
             Declaration::VariableDeclaration(declaration) => {
                 self.visit_variable_declaration(declaration)
             }
+            Declaration::TSModuleDeclaration(declaration) => {
+                self.visit_runtime_ts_module(declaration)
+            }
             Declaration::TSTypeAliasDeclaration(_)
             | Declaration::TSInterfaceDeclaration(_)
             | Declaration::TSEnumDeclaration(_)
-            | Declaration::TSModuleDeclaration(_)
             | Declaration::TSGlobalDeclaration(_)
             | Declaration::TSImportEqualsDeclaration(_) => {}
         }
@@ -1965,6 +2123,10 @@ impl EvidenceWalker<'_> {
             Statement::VariableDeclaration(declaration) => {
                 self.visit_variable_declaration(declaration)
             }
+            Statement::TSEnumDeclaration(declaration) => self.visit_runtime_ts_enum(declaration),
+            Statement::TSModuleDeclaration(declaration) => {
+                self.visit_runtime_ts_module(declaration)
+            }
             Statement::ExportDeclaration(node) => {
                 self.visit_declaration_without_collection(&node.declaration)
             }
@@ -1975,8 +2137,6 @@ impl EvidenceWalker<'_> {
             | Statement::ExportAllDeclaration(_)
             | Statement::TSTypeAliasDeclaration(_)
             | Statement::TSInterfaceDeclaration(_)
-            | Statement::TSEnumDeclaration(_)
-            | Statement::TSModuleDeclaration(_)
             | Statement::TSGlobalDeclaration(_)
             | Statement::TSImportEqualsDeclaration(_)
             | Statement::EmptyStatement(_)
@@ -2003,13 +2163,43 @@ impl EvidenceWalker<'_> {
             Declaration::VariableDeclaration(declaration) => {
                 self.visit_variable_declaration(declaration)
             }
+            Declaration::TSEnumDeclaration(declaration) => self.visit_runtime_ts_enum(declaration),
+            Declaration::TSModuleDeclaration(declaration) => {
+                self.visit_runtime_ts_module(declaration)
+            }
             Declaration::TSTypeAliasDeclaration(_)
             | Declaration::TSInterfaceDeclaration(_)
-            | Declaration::TSEnumDeclaration(_)
-            | Declaration::TSModuleDeclaration(_)
             | Declaration::TSGlobalDeclaration(_)
             | Declaration::TSImportEqualsDeclaration(_) => {}
         }
+    }
+
+    fn visit_runtime_ts_enum(&mut self, declaration: &TSEnumDeclaration<'_>) {
+        if !ts_enum_emits_runtime(declaration) {
+            return;
+        }
+        for member in &declaration.body.members {
+            if let Some(initializer) = &member.initializer {
+                self.visit_expression_without_collection(initializer);
+            }
+        }
+    }
+
+    fn visit_runtime_ts_module(&mut self, declaration: &TSModuleDeclaration<'_>) {
+        if !ts_module_emits_runtime(declaration) {
+            return;
+        }
+        self.scope.push(ts_module_name(declaration));
+        match declaration.body.as_ref() {
+            Some(TSModuleDeclarationBody::TSModuleBlock(block)) => {
+                self.visit_body_without_collection(&block.body);
+            }
+            Some(TSModuleDeclarationBody::TSModuleDeclaration(nested)) => {
+                self.visit_runtime_ts_module(nested.as_ref());
+            }
+            None => {}
+        }
+        self.scope.pop();
     }
 
     fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'_>) {
@@ -2057,6 +2247,11 @@ impl EvidenceWalker<'_> {
                 .unwrap_or(&owner.name)
                 .to_owned(),
         );
+        for parameter in &function.params.items {
+            if let Some(initializer) = &parameter.initializer {
+                self.collect_expression(owner, initializer);
+            }
+        }
         if let Some(body) = &function.body {
             self.collect_body(owner, &body.statements);
         }
@@ -2077,6 +2272,11 @@ impl EvidenceWalker<'_> {
                 .unwrap_or(&owner.name)
                 .to_owned(),
         );
+        for parameter in &arrow.params.items {
+            if let Some(initializer) = &parameter.initializer {
+                self.collect_expression(owner, initializer);
+            }
+        }
         match &arrow.body {
             ArrowFunctionBody::FunctionBody(body) => self.collect_body(owner, &body.statements),
             _ => self.collect_expression(owner, arrow.body.to_expression()),
@@ -2085,6 +2285,15 @@ impl EvidenceWalker<'_> {
     }
 
     fn collect_class_body(&mut self, class: &Class<'_>) {
+        let initializer = self.owner_for(class.span, FunctionKind::ClassInitializer, "<class>");
+        if let Some(owner) = initializer.as_ref() {
+            if let Some(super_class) = &class.super_class {
+                self.collect_expression(owner, super_class);
+            }
+            for decorator in &class.decorators {
+                self.collect_expression(owner, &decorator.expression);
+            }
+        }
         for element in &class.body.body {
             match element {
                 ClassElement::MethodDefinition(method) => {
@@ -2093,18 +2302,53 @@ impl EvidenceWalker<'_> {
                         self.collect_function_body(&owner, &method.value);
                     }
                 }
-                ClassElement::PropertyDefinition(property) => {
-                    if let Some(value) = &property.value {
-                        self.visit_expression_without_collection(value);
+                ClassElement::PropertyDefinition(property) => self.collect_class_property(
+                    initializer.as_ref(),
+                    &property.key,
+                    property.computed,
+                    &property.decorators,
+                    property.value.as_ref(),
+                ),
+                ClassElement::AccessorProperty(property) => self.collect_class_property(
+                    initializer.as_ref(),
+                    &property.key,
+                    property.computed,
+                    &property.decorators,
+                    property.value.as_ref(),
+                ),
+                ClassElement::StaticBlock(block) => {
+                    if let Some(owner) = initializer.as_ref() {
+                        self.collect_body(owner, &block.body);
+                    } else {
+                        self.visit_body_without_collection(&block.body);
                     }
                 }
-                ClassElement::AccessorProperty(property) => {
-                    if let Some(value) = &property.value {
-                        self.visit_expression_without_collection(value);
-                    }
-                }
-                ClassElement::StaticBlock(block) => self.visit_body_without_collection(&block.body),
                 ClassElement::TSIndexSignature(_) => {}
+            }
+        }
+    }
+
+    fn collect_class_property(
+        &mut self,
+        initializer: Option<&crate::evidence::LocalCallable>,
+        key: &PropertyKey<'_>,
+        computed: bool,
+        decorators: &[Decorator<'_>],
+        value: Option<&Expression<'_>>,
+    ) {
+        if computed && let (Some(owner), Some(key)) = (initializer, key.as_expression()) {
+            self.collect_expression(owner, key);
+        }
+        if let Some(owner) = initializer {
+            for decorator in decorators {
+                self.collect_expression(owner, &decorator.expression);
+            }
+        }
+        if let Some(value) = value {
+            if let Some(owner) = initializer {
+                self.collect_expression(owner, value);
+            } else {
+                self.visit_expression_without_collection(value);
             }
         }
     }
