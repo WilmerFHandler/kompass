@@ -16,8 +16,8 @@ use crate::evidence::EvidenceFile;
 use crate::identity;
 use crate::model::{
     AnalysisContract, AnalysisError, Burden, Category, CategorySummary, Coverage, ErrorKind,
-    FileAnalysis, FileReport, FunctionKind, FunctionReport, Language, LineCounts, Location,
-    MacroOpacity, Position, Report, SCORE_MODEL, Summary,
+    FileAnalysis, FileReport, FunctionKind, FunctionReport, Language, LanguageSummary, LineCounts,
+    Location, MacroOpacity, Position, Report, ReportScope, SCORE_MODEL, Summary,
 };
 use crate::score;
 use crate::tokens::{self, LexedSource, TokenPosition};
@@ -40,9 +40,18 @@ pub fn analyze(input: &Path, discovered: Discovery) -> Report {
 /// coupling discovery, reporting, or the Rust frontend to its AST types.
 pub fn analyze_with_frontends(
     input: &Path,
-    discovered: Discovery,
+    mut discovered: Discovery,
     python_analyzer: Option<PythonAnalyzer>,
 ) -> Report {
+    let scope = ReportScope {
+        selection: if discovered.explicit_file {
+            "file".to_owned()
+        } else {
+            "directory".to_owned()
+        },
+        language_filter: discovered.language_filter.serialized().to_owned(),
+        category_policy: "production-test-separated-v1".to_owned(),
+    };
     let canonical_input = fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());
     let root = if canonical_input.is_file() {
         canonical_input
@@ -52,6 +61,15 @@ pub fn analyze_with_frontends(
     } else {
         canonical_input.clone()
     };
+
+    // Discovery normally returns canonical paths, but callers of this public
+    // seam may construct a Discovery directly. Normalize those paths too so
+    // module reachability and display paths behave consistently on systems
+    // where temporary directories have symlinked aliases (for example
+    // `/var` and `/private/var` on macOS).
+    for file in &mut discovered.files {
+        file.path = fs::canonicalize(&file.path).unwrap_or_else(|_| file.path.clone());
+    }
 
     let test_context_files = discover_test_context_files(&discovered.files);
     let mut test_files = discovered
@@ -176,6 +194,7 @@ pub fn analyze_with_frontends(
         model: SCORE_MODEL.to_owned(),
         analysis_contract: AnalysisContract::current(),
         root: root.to_string_lossy().into_owned(),
+        scope,
         summary,
         coverage,
         macro_opacity,
@@ -1088,7 +1107,40 @@ fn summarize(files: &[FileReport]) -> Summary {
             .total_score
             .saturating_add(summary.test.total_score),
     };
+    summary.by_language.rust = summarize_language(files, Language::Rust);
+    summary.by_language.python = summarize_language(files, Language::Python);
     summary
+}
+
+fn summarize_language(files: &[FileReport], language: Language) -> LanguageSummary {
+    let matching = files
+        .iter()
+        .filter(|file| file.language == language)
+        .collect::<Vec<_>>();
+    let production = matching
+        .iter()
+        .flat_map(|file| &file.functions)
+        .filter(|function| function.category == Category::Production)
+        .collect::<Vec<_>>();
+    let test = matching
+        .iter()
+        .flat_map(|file| &file.functions)
+        .filter(|function| function.category == Category::Test)
+        .collect::<Vec<_>>();
+    let production = summarize_category(&production);
+    let test = summarize_category(&test);
+    LanguageSummary {
+        files: matching.len(),
+        code_lines: matching.iter().map(|file| file.lines.code).sum(),
+        tokens: matching.iter().map(|file| file.tokens).sum(),
+        burden: Burden {
+            production: production.total_score,
+            test: test.total_score,
+            total: production.total_score.saturating_add(test.total_score),
+        },
+        production,
+        test,
+    }
 }
 
 fn summarize_category(functions: &[&FunctionReport]) -> CategorySummary {
@@ -2119,6 +2171,7 @@ mod tests {
             model: SCORE_MODEL.to_owned(),
             analysis_contract: AnalysisContract::current(),
             root: "/tmp".to_owned(),
+            scope: ReportScope::default(),
             summary,
             coverage: Coverage {
                 discovered_files: 1,
@@ -2435,6 +2488,7 @@ mod tests {
                     },
                 ],
                 test_files: 0,
+                ..Discovery::default()
             },
         );
 
@@ -2496,6 +2550,7 @@ mod tests {
                     },
                 ],
                 test_files: 0,
+                ..Discovery::default()
             },
         );
 
@@ -2572,6 +2627,7 @@ mod tests {
                     },
                 ],
                 test_files: 0,
+                ..Discovery::default()
             },
         );
 
@@ -2747,6 +2803,7 @@ mod tests {
                     category: Category::Production,
                 }],
                 test_files: 0,
+                ..Discovery::default()
             },
         );
 

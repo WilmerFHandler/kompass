@@ -240,6 +240,11 @@ fn raw_literal_end(bytes: &[u8], start: usize, language: Language) -> Option<usi
         start
     } else if bytes.get(start) == Some(&b'b') && bytes.get(start + 1) == Some(&b'r') {
         start + 1
+    } else if bytes.get(start) == Some(&b'c') && bytes.get(start + 1) == Some(&b'r') {
+        // Rust's raw C string literal uses the `cr` prefix. Keep it in the
+        // same opaque token as `r` and `br`, otherwise a quote in its body
+        // can expose comment markers and truncate the fingerprint.
+        start + 1
     } else {
         return None;
     };
@@ -314,12 +319,32 @@ mod tests {
     }
 
     #[test]
+    fn raw_literals_do_not_expose_inner_quotes_as_comments() {
+        let before = "let value = r###\"contains \" // one /* marker */\"###; value";
+        let after = "let value=r###\"contains \" // two /* changed */\"###; value";
+        assert_ne!(
+            lexical_fingerprint(before, 0, before.len(), Language::Rust),
+            lexical_fingerprint(after, 0, after.len(), Language::Rust)
+        );
+    }
+
+    #[test]
     fn python_prefixed_and_triple_literals_protect_hashes() {
         let before = "value = f\"\"\"# inside // text\"\"\"";
         let after = "value=f\"\"\"# inside // text\"\"\"";
         assert_eq!(
             lexical_fingerprint(before, 0, before.len(), Language::Python),
             lexical_fingerprint(after, 0, after.len(), Language::Python)
+        );
+    }
+
+    #[test]
+    fn raw_c_literals_protect_quotes_and_comment_markers() {
+        let before = r####"let value = cr###"contains " // marker /* one */"###; value"####;
+        let after = r####"let value=cr###"contains " // changed /* two */"###; value"####;
+        assert_ne!(
+            lexical_fingerprint(before, 0, before.len(), Language::Rust),
+            lexical_fingerprint(after, 0, after.len(), Language::Rust)
         );
     }
 }

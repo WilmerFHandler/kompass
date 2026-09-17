@@ -20,21 +20,22 @@ use crate::model::{
     ScoreComponent, Summary,
 };
 
-/// Evidence is intentionally an explicit placeholder until a semantic
-/// evidence module can provide call-graph, duplication, or behavior links.
+/// A source-local evidence record relevant to one explained callable. The
+/// complete evidence graph remains available at the report level; this
+/// projection keeps the candidate payload bounded while retaining the actual
+/// call, reachability, and duplicate records that mention the candidate.
 #[derive(Clone, Debug, Serialize)]
-pub struct EvidencePlaceholder {
-    pub kind: String,
-    pub status: String,
-    pub detail: String,
-}
-
-fn unavailable_evidence() -> Vec<EvidencePlaceholder> {
-    vec![EvidencePlaceholder {
-        kind: "semantic-evidence".to_owned(),
-        status: "unavailable".to_owned(),
-        detail: "No evidence module is configured; this explanation is syntax-only.".to_owned(),
-    }]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExplainEvidence {
+    CallEdge {
+        edge: crate::evidence::CallEdge,
+    },
+    CallRegion {
+        region: crate::evidence::CallRegion,
+    },
+    DuplicateGroup {
+        group: crate::evidence::DuplicateGroup,
+    },
 }
 
 /// The complete scope context shared by compact analysis output.
@@ -45,6 +46,9 @@ pub struct AnalysisScope {
     pub discovered_files: usize,
     pub analyzed_files: usize,
     pub languages: LanguageCounts,
+    pub selection: String,
+    pub language_filter: String,
+    pub category_policy: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -59,6 +63,7 @@ pub struct AggregateSnapshot {
 pub struct CompactAnalysis {
     pub report_kind: String,
     pub schema_version: u32,
+    pub evidence_version: String,
     pub tool: String,
     pub version: String,
     pub model: String,
@@ -130,6 +135,7 @@ pub fn compact_analysis(
     CompactAnalysis {
         report_kind: "analysis_compact".to_owned(),
         schema_version: SCHEMA_VERSION,
+        evidence_version: report.evidence_version.clone(),
         tool: report.tool.clone(),
         version: report.version.clone(),
         model: report.model.clone(),
@@ -155,6 +161,9 @@ fn analysis_scope(report: &Report) -> AnalysisScope {
         discovered_files: report.coverage.discovered_files,
         analyzed_files: report.coverage.analyzed_files,
         languages: report.summary.languages.clone(),
+        selection: report.scope.selection.clone(),
+        language_filter: report.scope.language_filter.clone(),
+        category_policy: report.scope.category_policy.clone(),
     }
 }
 
@@ -210,6 +219,7 @@ fn compare_functions(
 pub struct CompactDiff {
     pub report_kind: String,
     pub schema_version: u32,
+    pub evidence_version: String,
     pub comparable: bool,
     pub tool: String,
     pub version: String,
@@ -268,6 +278,7 @@ pub fn compact_diff(comparison: &Comparison, top: usize) -> CompactDiff {
     CompactDiff {
         report_kind: "diff_compact".to_owned(),
         schema_version: SCHEMA_VERSION,
+        evidence_version: comparison.after.evidence_version.clone(),
         comparable: comparison.comparable,
         tool: "kompass".to_owned(),
         version: comparison.after.version.clone(),
@@ -319,13 +330,6 @@ pub fn explain_report(
         .files
         .iter()
         .find(|file| file.path == target)
-        .or_else(|| {
-            report.files.iter().find(|file| {
-                Path::new(&file.path)
-                    .file_name()
-                    .is_some_and(|name| Some(name) == canonical.file_name())
-            })
-        })
         .ok_or_else(|| format!("no analyzed file record matches {}", input_path.display()))?;
 
     let mut containing = file
@@ -353,12 +357,21 @@ pub fn explain_report(
     let candidates = containing
         .into_iter()
         .enumerate()
-        .map(|(index, function)| ExplainCandidate::new(function, Some(index) == innermost_index))
+        .map(|(index, function)| {
+            ExplainCandidate::new(
+                file.path.as_str(),
+                file.language,
+                function,
+                Some(index) == innermost_index,
+                &report.evidence,
+            )
+        })
         .collect::<Vec<_>>();
 
     Ok(ExplainReport {
         report_kind: "explain".to_owned(),
         schema_version: SCHEMA_VERSION,
+        evidence_version: report.evidence_version.clone(),
         tool: report.tool.clone(),
         version: report.version.clone(),
         model: report.model.clone(),
@@ -368,6 +381,9 @@ pub fn explain_report(
             path: target,
             line,
             files: report.summary.files,
+            selection: report.scope.selection.clone(),
+            language_filter: report.scope.language_filter.clone(),
+            category_policy: report.scope.category_policy.clone(),
         },
         coverage: report.coverage.clone(),
         aggregates: AggregateSnapshot {
@@ -377,7 +393,7 @@ pub fn explain_report(
         returned: candidates.len(),
         total: candidates.len(),
         candidates,
-        evidence: unavailable_evidence(),
+        evidence: report.evidence.clone(),
         errors: report.errors.clone(),
     })
 }
@@ -404,12 +420,16 @@ pub struct ExplainScope {
     pub path: String,
     pub line: usize,
     pub files: usize,
+    pub selection: String,
+    pub language_filter: String,
+    pub category_policy: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ExplainReport {
     pub report_kind: String,
     pub schema_version: u32,
+    pub evidence_version: String,
     pub tool: String,
     pub version: String,
     pub model: String,
@@ -420,7 +440,7 @@ pub struct ExplainReport {
     pub returned: usize,
     pub total: usize,
     pub candidates: Vec<ExplainCandidate>,
-    pub evidence: Vec<EvidencePlaceholder>,
+    pub evidence: crate::evidence::Evidence,
     pub errors: Vec<AnalysisError>,
 }
 
@@ -435,7 +455,7 @@ pub struct ExplainCandidate {
     pub score: Score,
     pub innermost: bool,
     pub components: Vec<ExplainComponent>,
-    pub evidence: Vec<EvidencePlaceholder>,
+    pub evidence: Vec<ExplainEvidence>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -446,7 +466,13 @@ pub struct ExplainComponent {
 }
 
 impl ExplainCandidate {
-    fn new(function: &FunctionReport, innermost: bool) -> Self {
+    fn new(
+        path: &str,
+        language: Language,
+        function: &FunctionReport,
+        innermost: bool,
+        evidence: &crate::evidence::Evidence,
+    ) -> Self {
         let components = ScoreComponent::ALL
             .into_iter()
             .map(|component| {
@@ -481,9 +507,60 @@ impl ExplainCandidate {
             score: function.score.clone(),
             innermost,
             components,
-            evidence: unavailable_evidence(),
+            evidence: candidate_evidence(path, language, function, evidence),
         }
     }
+}
+
+fn candidate_evidence(
+    path: &str,
+    language: Language,
+    function: &FunctionReport,
+    evidence: &crate::evidence::Evidence,
+) -> Vec<ExplainEvidence> {
+    let callable = crate::evidence::CallableRef {
+        snapshot_id: function.snapshot_id.clone(),
+        path: path.to_owned(),
+        language,
+        category: function.category,
+        name: function.name.clone(),
+        kind: function.kind.clone(),
+        location: function.location.clone(),
+    };
+    let mut records = Vec::new();
+    records.extend(
+        evidence
+            .call_graph
+            .edges
+            .iter()
+            .filter(|edge| edge.caller == callable || edge.callee.as_ref() == Some(&callable))
+            .cloned()
+            .map(|edge| ExplainEvidence::CallEdge { edge }),
+    );
+    records.extend(
+        evidence
+            .call_graph
+            .regions
+            .iter()
+            .filter(|region| region.root == callable)
+            .cloned()
+            .map(|region| ExplainEvidence::CallRegion { region }),
+    );
+    records.extend(
+        evidence
+            .duplicates
+            .groups
+            .iter()
+            .filter(|group| {
+                group
+                    .occurrences
+                    .iter()
+                    .any(|occurrence| occurrence.callable == callable)
+            })
+            .cloned()
+            .map(|group| ExplainEvidence::DuplicateGroup { group }),
+    );
+    records
 }
 
 fn component_units(score: &Score, component: ScoreComponent) -> usize {

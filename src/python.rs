@@ -61,7 +61,7 @@ pub fn analyze_file(
     };
     collector.collect_module(module);
     let functions = collector.functions;
-    let evidence = extract_python_evidence(source, parsed.tokens(), module, &functions);
+    let evidence = extract_python_evidence(source, &token_index, &line_map, module, &functions);
 
     Ok(FileAnalysis {
         lines: line_map.counts.clone(),
@@ -83,17 +83,43 @@ pub fn analyze(source: &str, category: Category) -> Result<FileAnalysis, String>
 /// builder.
 fn extract_python_evidence(
     source: &str,
-    tokens: &Tokens,
+    token_index: &TokenIndex,
+    line_map: &LineMap,
     module: &ModModule,
     functions: &[FunctionReport],
 ) -> crate::evidence::FrontendEvidence {
-    let line_map = LineMap::new(source, tokens);
     let imports = python_imports(module);
+    let mut owners_by_exact = std::collections::BTreeMap::new();
+    let mut owners_by_name = std::collections::BTreeMap::<
+        (String, FunctionKind),
+        Vec<crate::evidence::LocalCallable>,
+    >::new();
+    for function in functions {
+        let owner = crate::evidence::LocalCallable {
+            name: function.name.clone(),
+            kind: function.kind.clone(),
+            category: function.category,
+            location: function.location.clone(),
+        };
+        owners_by_exact.insert(
+            (
+                function.name.clone(),
+                function.kind.clone(),
+                function.location.clone(),
+            ),
+            owner.clone(),
+        );
+        owners_by_name
+            .entry((function.name.clone(), function.kind.clone()))
+            .or_default()
+            .push(owner);
+    }
     let mut collector = PythonEvidenceCollector {
         source,
-        tokens,
-        line_map: &line_map,
-        functions,
+        token_index,
+        line_map,
+        owners_by_exact,
+        owners_by_name,
         imports,
         scopes: Vec::new(),
         function_depth: 0,
@@ -170,9 +196,14 @@ impl<'ast> Visitor<'ast> for PythonImportCollector {
 
 struct PythonEvidenceCollector<'a> {
     source: &'a str,
-    tokens: &'a Tokens,
+    token_index: &'a TokenIndex,
     line_map: &'a LineMap,
-    functions: &'a [FunctionReport],
+    owners_by_exact: std::collections::BTreeMap<
+        (String, FunctionKind, Location),
+        crate::evidence::LocalCallable,
+    >,
+    owners_by_name:
+        std::collections::BTreeMap<(String, FunctionKind), Vec<crate::evidence::LocalCallable>>,
     imports: PythonImports,
     scopes: Vec<String>,
     function_depth: usize,
@@ -200,24 +231,17 @@ impl PythonEvidenceCollector<'_> {
     ) -> Option<crate::evidence::LocalCallable> {
         let start = self.line_map.position(range.start());
         let end = self.line_map.end_position(range.end());
-        self.functions
-            .iter()
-            .find(|function| {
-                function.name == name
-                    && function.kind == kind
-                    && function.location.start == start
-                    && function.location.end == end
-            })
+        let location = Location { start, end };
+        self.owners_by_exact
+            .get(&(name.clone(), kind.clone(), location))
+            .cloned()
             .or_else(|| {
-                self.functions
-                    .iter()
-                    .find(|function| function.name == name && function.kind == kind)
-            })
-            .map(|function| crate::evidence::LocalCallable {
-                name: function.name.clone(),
-                kind: function.kind.clone(),
-                category: function.category,
-                location: function.location.clone(),
+                self.owners_by_name
+                    .get(&(name, kind))
+                    .and_then(|owners| match owners.as_slice() {
+                        [owner] => Some(owner.clone()),
+                        _ => None,
+                    })
             })
     }
 
@@ -230,7 +254,7 @@ impl PythonEvidenceCollector<'_> {
         let mut statements = PythonStatementCollector {
             owner: owner.clone(),
             source: self.source,
-            tokens: self.tokens,
+            token_index: self.token_index,
             line_map: self.line_map,
             next_sequence: &mut self.next_sequence,
             statements: &mut self.evidence.statements,
@@ -277,7 +301,7 @@ impl PythonEvidenceCollector<'_> {
         let mut statements = PythonStatementCollector {
             owner: owner.clone(),
             source: self.source,
-            tokens: self.tokens,
+            token_index: self.token_index,
             line_map: self.line_map,
             next_sequence: &mut self.next_sequence,
             statements: &mut self.evidence.statements,
@@ -315,11 +339,15 @@ impl<'ast> Visitor<'ast> for PythonEvidenceCollector<'_> {
                 self.scopes.pop();
             }
             Stmt::ClassDef(node) => {
+                // UnitCollector names a class initializer after the class
+                // scope (`Class::<class>`), so enter that scope before
+                // looking up the owner. This keeps direct class-body work in
+                // its exclusive initializer unit instead of dropping it.
+                self.scopes.push(node.name.as_str().to_owned());
                 let name = self.qualified_name("<class>");
                 if let Some(owner) = self.owner(name, FunctionKind::ClassInitializer, node.range) {
                     self.collect_body(&owner, &node.body, std::collections::BTreeSet::new());
                 }
-                self.scopes.push(node.name.as_str().to_owned());
                 self.class_depth += 1;
                 for statement in &node.body {
                     self.visit_stmt(statement);
@@ -505,7 +533,7 @@ impl<'ast> Visitor<'ast> for PythonCallCollector<'_> {
 struct PythonStatementCollector<'a> {
     owner: crate::evidence::LocalCallable,
     source: &'a str,
-    tokens: &'a Tokens,
+    token_index: &'a TokenIndex,
     line_map: &'a LineMap,
     next_sequence: &'a mut usize,
     statements: &'a mut Vec<crate::evidence::FrontendStatement>,
@@ -526,7 +554,7 @@ impl PythonStatementCollector<'_> {
                 sequence,
                 ordinal,
                 location: self.location(range),
-                tokens: python_statement_tokens(self.source, self.tokens, range),
+                tokens: self.token_index.text_in(self.source, range),
                 scored_signals: python_statement_signals(statement),
             });
             ordinal += 1;
@@ -546,7 +574,7 @@ impl PythonStatementCollector<'_> {
             sequence,
             ordinal: 0,
             location: self.location(expression.range()),
-            tokens: python_statement_tokens(self.source, self.tokens, expression.range()),
+            tokens: self.token_index.text_in(self.source, expression.range()),
             scored_signals: python_expression_signals(expression),
         });
     }
@@ -576,24 +604,6 @@ impl<'ast> Visitor<'ast> for PythonStatementCollector<'_> {
             visitor::walk_expr(self, expression);
         }
     }
-}
-
-fn python_statement_tokens(source: &str, tokens: &Tokens, range: TextRange) -> Vec<String> {
-    tokens
-        .iter()
-        .filter(|token| {
-            let token_range = token.range();
-            token_range.start() >= range.start()
-                && token_range.end() <= range.end()
-                && is_counted_token(token.kind())
-        })
-        .filter_map(|token| {
-            let token_range = token.range();
-            source
-                .get(token_range.start().to_usize()..token_range.end().to_usize())
-                .map(str::to_owned)
-        })
-        .collect()
 }
 
 #[derive(Default)]
@@ -738,6 +748,18 @@ impl TokenIndex {
             .unwrap_or(0)
             .saturating_sub(self.prefix.get(first).copied().unwrap_or(0))
     }
+
+    fn text_in(&self, source: &str, range: TextRange) -> Vec<String> {
+        let start = range.start().to_usize();
+        let end = range.end().to_usize();
+        let first = self.starts.partition_point(|candidate| *candidate < start);
+        let last = self.starts.partition_point(|candidate| *candidate < end);
+        (first..last)
+            .filter(|index| self.ends[*index] <= end)
+            .filter_map(|index| source.get(self.starts[index]..self.ends[index]))
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -880,6 +902,31 @@ struct UnitCollector<'a> {
     functions: Vec<FunctionReport>,
 }
 
+#[derive(Clone, Copy)]
+struct UnitRanges {
+    full: TextRange,
+    declaration: TextRange,
+    body: TextRange,
+}
+
+impl UnitRanges {
+    fn new(full: TextRange, body: TextRange) -> Self {
+        Self {
+            full,
+            declaration: declaration_range(full, body),
+            body,
+        }
+    }
+
+    fn initializer(full: TextRange, body: TextRange) -> Self {
+        Self {
+            full,
+            declaration: full,
+            body,
+        }
+    }
+}
+
 impl<'a> UnitCollector<'a> {
     fn collect_module(&mut self, module: &ModModule) {
         let range = TextRange::new(TextSize::new(0), text_size(self.source.len()));
@@ -894,9 +941,7 @@ impl<'a> UnitCollector<'a> {
             self.functions.push(self.make_report(
                 self.qualified_name("<module>"),
                 FunctionKind::ModuleInitializer,
-                range,
-                range,
-                body_range(&module.body).unwrap_or(range),
+                UnitRanges::initializer(range, body_range(&module.body).unwrap_or(range)),
                 metrics,
                 contributions,
             ));
@@ -938,9 +983,7 @@ impl<'a> UnitCollector<'a> {
         self.functions.push(self.make_report(
             qualified_name,
             kind,
-            range,
-            declaration_range(range, body),
-            body,
+            UnitRanges::new(range, body),
             metrics,
             with_parameter_contributions(contributions, &node.parameters, is_method, node),
         ));
@@ -967,9 +1010,7 @@ impl<'a> UnitCollector<'a> {
             self.functions.push(self.make_report(
                 qualified_name,
                 FunctionKind::ClassInitializer,
-                range,
-                range,
-                body_range(&node.body).unwrap_or(range),
+                UnitRanges::initializer(range, body_range(&node.body).unwrap_or(range)),
                 metrics,
                 contributions,
             ));
@@ -1002,9 +1043,7 @@ impl<'a> UnitCollector<'a> {
         self.functions.push(self.make_report(
             qualified_name,
             FunctionKind::Lambda,
-            range,
-            declaration_range(range, body),
-            body,
+            UnitRanges::new(range, body),
             metrics,
             with_lambda_parameter_contributions(contributions, parameters),
         ));
@@ -1080,12 +1119,15 @@ impl<'a> UnitCollector<'a> {
         &self,
         name: String,
         kind: FunctionKind,
-        range: TextRange,
-        declaration: TextRange,
-        body: TextRange,
+        ranges: UnitRanges,
         metrics: Metrics,
         mut contributions: Vec<PendingContribution>,
     ) -> FunctionReport {
+        let UnitRanges {
+            full: range,
+            declaration,
+            body,
+        } = ranges;
         let start = self.line_map.position(range.start());
         let end = self.line_map.end_position(range.end());
         let lines = end.line.saturating_sub(start.line) + 1;

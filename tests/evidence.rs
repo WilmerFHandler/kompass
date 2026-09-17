@@ -1,13 +1,17 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kompass::analyze::analyze;
 use kompass::discover::{DiscoveredFile, Discovery};
 use kompass::model::{Category, Language};
 
+static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+
 fn report(source: &str, language: Language) -> kompass::Report {
     let root = std::env::temp_dir().join(format!(
-        "kompass-evidence-test-{}-{}",
+        "kompass-evidence-test-{}-{}-{}",
         std::process::id(),
+        NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -29,6 +33,7 @@ fn report(source: &str, language: Language) -> kompass::Report {
                 category: Category::Production,
             }],
             test_files: 0,
+            ..Discovery::default()
         },
     );
     remove_tree(&root);
@@ -82,6 +87,133 @@ impl Item { fn run(&self) -> i32 { target(1) } }
             .iter()
             .any(|unit| unit.name.ends_with("target"))
     );
+}
+
+#[test]
+fn evidence_references_join_back_to_snapshot_callable_ids() {
+    let report = report(
+        "fn target(value: i32) -> i32 { value + 1 }\n\nfn caller(value: i32) -> i32 { target(value) }\n",
+        Language::Rust,
+    );
+    let functions = &report.files[0].functions;
+    let caller = functions
+        .iter()
+        .find(|function| function.name == "caller")
+        .unwrap();
+    let target = functions
+        .iter()
+        .find(|function| function.name == "target")
+        .unwrap();
+    let edge = report
+        .evidence
+        .call_graph
+        .edges
+        .iter()
+        .find(|edge| edge.callee_name == "target" && edge.callee.is_some())
+        .unwrap();
+    assert_eq!(edge.caller.snapshot_id, caller.snapshot_id);
+    assert_eq!(
+        edge.callee.as_ref().unwrap().snapshot_id,
+        target.snapshot_id
+    );
+}
+
+#[test]
+fn nested_direct_calls_use_nearest_source_scope() {
+    let rust = report(
+        r#"
+fn outer(value: i32) -> i32 {
+    fn helper(value: i32) -> i32 { value + 1 }
+    helper(value)
+}
+
+fn other(value: i32) -> i32 {
+    fn helper(value: i32) -> i32 { value + 2 }
+    helper(value)
+}
+"#,
+        Language::Rust,
+    );
+    let resolved = rust
+        .evidence
+        .call_graph
+        .edges
+        .iter()
+        .filter(|edge| edge.callee_name == "helper")
+        .collect::<Vec<_>>();
+    assert_eq!(resolved.len(), 2);
+    assert!(resolved.iter().all(|edge| {
+        edge.resolution == kompass::evidence::CallResolution::Resolved
+            && edge.callee.as_ref().is_some_and(|callee| {
+                callee.name == "outer::helper" || callee.name == "other::helper"
+            })
+    }));
+    assert!(resolved.iter().any(|edge| {
+        edge.caller.name == "outer" && edge.callee.as_ref().unwrap().name == "outer::helper"
+    }));
+    assert!(resolved.iter().any(|edge| {
+        edge.caller.name == "other" && edge.callee.as_ref().unwrap().name == "other::helper"
+    }));
+
+    let python = report(
+        r#"
+def outer(value):
+    def helper(value):
+        return value + 1
+    return helper(value)
+
+def other(value):
+    def helper(value):
+        return value + 2
+    return helper(value)
+"#,
+        Language::Python,
+    );
+    let resolved = python
+        .evidence
+        .call_graph
+        .edges
+        .iter()
+        .filter(|edge| edge.callee_name == "helper")
+        .collect::<Vec<_>>();
+    assert_eq!(resolved.len(), 2);
+    assert!(resolved.iter().all(|edge| {
+        edge.resolution == kompass::evidence::CallResolution::Resolved
+            && edge.callee.as_ref().is_some_and(|callee| {
+                callee.name == "outer::helper" || callee.name == "other::helper"
+            })
+    }));
+}
+
+#[test]
+fn python_class_body_calls_belong_to_the_class_initializer() {
+    let report = report(
+        r#"
+def helper(value):
+    return value + 1
+
+class Box:
+    value = helper(1)
+
+    def read(self):
+        return self.value
+"#,
+        Language::Python,
+    );
+    let initializer = report.files[0]
+        .functions
+        .iter()
+        .find(|function| function.name == "Box::<class>")
+        .unwrap();
+    let edge = report
+        .evidence
+        .call_graph
+        .edges
+        .iter()
+        .find(|edge| edge.caller.name == "Box::<class>" && edge.callee_name == "helper")
+        .unwrap();
+    assert_eq!(edge.resolution, kompass::evidence::CallResolution::Resolved);
+    assert_eq!(edge.caller.snapshot_id, initializer.snapshot_id);
 }
 
 #[test]

@@ -23,6 +23,8 @@ pub struct DiscoveredFile {
 pub struct Discovery {
     pub files: Vec<DiscoveredFile>,
     pub test_files: usize,
+    pub language_filter: LanguageFilter,
+    pub explicit_file: bool,
 }
 
 #[derive(Debug)]
@@ -64,6 +66,14 @@ impl LanguageFilter {
             (Self::All, _) | (Self::Rust, Language::Rust) | (Self::Python, Language::Python)
         )
     }
+
+    pub const fn serialized(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Rust => "rust",
+            Self::Python => "python",
+        }
+    }
 }
 
 /// Discover source files from an explicit file/directory or a Cargo
@@ -101,6 +111,8 @@ pub fn discover_with_language(
                 category,
             }],
             test_files: usize::from(category == Category::Test),
+            language_filter,
+            explicit_file: true,
         });
     }
 
@@ -115,7 +127,10 @@ pub fn discover_with_language(
     // directly, so keep its interpreter metadata from turning the environment
     // into an analyzed project.
     if should_skip_directory(&path) {
-        return Ok(Discovery::default());
+        return Ok(Discovery {
+            language_filter,
+            ..Discovery::default()
+        });
     }
 
     if path.join("Cargo.toml").is_file() && language_filter.includes(Language::Rust) {
@@ -251,7 +266,12 @@ fn discover_cargo_targets(
         .filter(|file| file.category == Category::Test)
         .count();
 
-    Ok(Discovery { files, test_files })
+    Ok(Discovery {
+        files,
+        test_files,
+        language_filter,
+        explicit_file: false,
+    })
 }
 
 fn discover_filesystem(root: &Path, language_filter: LanguageFilter) -> std::io::Result<Discovery> {
@@ -280,6 +300,8 @@ fn discover_filesystem(root: &Path, language_filter: LanguageFilter) -> std::io:
             .filter(|file| file.category == Category::Test)
             .count(),
         files,
+        language_filter,
+        explicit_file: false,
     })
 }
 
@@ -499,6 +521,7 @@ mod tests {
         std::fs::write(root.join(".ignore"), "ignored/\n").unwrap();
 
         let discovery = discover_with_language(&root, LanguageFilter::Python).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
         let paths = discovery
             .files
             .iter()
@@ -617,6 +640,7 @@ mod tests {
         std::fs::write(&external_source, "pub fn shared() {}\n").unwrap();
 
         let discovery = discover(&package).unwrap();
+        let external_source = std::fs::canonicalize(external_source).unwrap();
         assert!(discovery.files.iter().any(|file| {
             file.path == external_source
                 && file.language == Language::Rust

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::explain;
 use crate::identity;
-use crate::model::{AnalysisContract, OutputFormat, SCHEMA_VERSION};
+use crate::model::{AnalysisContract, OutputFormat, ReportScope, SCHEMA_VERSION};
 
 const COMPONENT_NAMES: [&str; 8] = [
     "boundary",
@@ -123,6 +123,7 @@ pub struct ReportMetadata {
     pub evidence_version: String,
     pub model: String,
     pub analysis_contract: AnalysisContract,
+    pub scope: ReportScope,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -332,6 +333,12 @@ fn compare_reports(
             after.analysis_contract.display()
         ));
     }
+    if before.scope != after.scope {
+        issues.push(format!(
+            "analysis scope policy differs: before is {:?}, after is {:?}; use the same selection, language filter, and category policy",
+            before.scope, after.scope
+        ));
+    }
     if before.root != after.root && !options.allow_root_change {
         issues.push(format!(
             "analyzed roots differ: before is {:?}, after is {:?}; use the same input root or pass --allow-root-change",
@@ -505,7 +512,7 @@ fn validate_identity(label: &str, report: &InputReport, issues: &mut Vec<String>
             "{label} report has an incomplete analysis contract; regenerate it with a multi-language Kompass"
         ));
     }
-    if report.schema_version != 0 && report.schema_version != SCHEMA_VERSION {
+    if report.schema_version != SCHEMA_VERSION {
         issues.push(format!(
             "{label} report schema version is {}, but this Kompass supports {}",
             report.schema_version, SCHEMA_VERSION
@@ -807,6 +814,7 @@ fn match_unique_stage<F>(
 {
     let mut before_groups = BTreeMap::<String, Vec<FunctionKey>>::new();
     let mut after_groups = BTreeMap::<String, Vec<FunctionKey>>::new();
+    let mut ambiguous_groups = Vec::<(usize, usize, String)>::new();
     for key in remaining_before.iter() {
         let function = before[key];
         before_groups
@@ -840,13 +848,44 @@ fn match_unique_stage<F>(
             && !after_candidates.is_empty()
             && (before_candidates.len() > 1 || after_candidates.len() > 1)
         {
-            warnings.push(format!(
-                "ambiguous {} match for {} before unit(s) and {} after unit(s); units remain unmatched",
-                basis.label(),
+            let before_example = before_candidates
+                .first()
+                .map(FunctionKey::display)
+                .unwrap_or_else(|| "none".to_owned());
+            let after_example = after_candidates
+                .first()
+                .map(FunctionKey::display)
+                .unwrap_or_else(|| "none".to_owned());
+            ambiguous_groups.push((
                 before_candidates.len(),
-                after_candidates.len()
+                after_candidates.len(),
+                format!("{before_example} -> {after_example}"),
             ));
         }
+    }
+
+    if !ambiguous_groups.is_empty() {
+        let before_units = ambiguous_groups
+            .iter()
+            .map(|(before, _, _)| *before)
+            .sum::<usize>();
+        let after_units = ambiguous_groups
+            .iter()
+            .map(|(_, after, _)| *after)
+            .sum::<usize>();
+        let examples = ambiguous_groups
+            .iter()
+            .take(3)
+            .map(|(_, _, example)| example.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        warnings.push(format!(
+            "ambiguous {} match stage: {} candidate group(s), {} before and {} after unit(s) left for later evidence; examples: {examples}",
+            basis.label(),
+            ambiguous_groups.len(),
+            before_units,
+            after_units,
+        ));
     }
 }
 
@@ -1076,9 +1115,8 @@ fn redistribution_hint(
         added_count,
         added_burden,
         file_total: metric_delta(before_total, after_total),
-        note:
-            "This is only a possible redistribution; it proves no call or extraction relationship."
-                .to_owned(),
+        note: "A matched callable became cheaper while new callables appeared and file burden did not fall; complexity may have been redistributed. This is only a possible redistribution; it proves no call or extraction relationship."
+            .to_owned(),
     })
 }
 
@@ -1090,14 +1128,19 @@ fn collect_matched_reductions(
 ) -> Vec<FunctionChange> {
     let mut reductions = Vec::new();
     for (key, before_function) in before_functions {
-        if key.path != path || key.category != category {
+        if key.path != path || key.category != category || !redistribution_candidate_kind(&key.kind)
+        {
             continue;
         }
-        if let Some(after_function) = after_functions.get(key)
-            && after_function.score.value < before_function.score.value
-        {
+        let mut candidates = after_functions
+            .iter()
+            .filter(|(after_key, _)| same_qualified_unit(key, after_key));
+        let Some((after_key, after_function)) = candidates.next() else {
+            continue;
+        };
+        if candidates.next().is_none() && after_function.score.value < before_function.score.value {
             reductions.push(function_change(
-                key,
+                after_key,
                 ChangeStatus::Changed,
                 Some(before_function.score.value),
                 Some(after_function.score.value),
@@ -1116,12 +1159,33 @@ fn added_callable_summary(
     let mut count = 0usize;
     let mut burden = 0usize;
     for (key, after_function) in after_functions {
-        if key.path == path && key.category == category && !before_functions.contains_key(key) {
+        if key.path == path
+            && key.category == category
+            && redistribution_candidate_kind(&key.kind)
+            && !before_functions
+                .keys()
+                .any(|before_key| same_qualified_unit(before_key, key))
+        {
             count = count.saturating_add(1);
             burden = burden.saturating_add(after_function.score.value);
         }
     }
     (count, burden)
+}
+
+fn redistribution_candidate_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function" | "method" | "trait_method" | "nested_function"
+    )
+}
+
+fn same_qualified_unit(left: &FunctionKey, right: &FunctionKey) -> bool {
+    left.path == right.path
+        && left.language == right.language
+        && left.category == right.category
+        && left.kind == right.kind
+        && canonical_unit_name(&left.name) == canonical_unit_name(&right.name)
 }
 
 fn category_file_burden(file: &InputFile, category: &str) -> usize {
@@ -1276,6 +1340,7 @@ fn metadata(path: &Path, report: &InputReport) -> ReportMetadata {
         evidence_version: report.evidence_version.clone(),
         model: report.model.clone(),
         analysis_contract: report.analysis_contract.clone(),
+        scope: report.scope.clone(),
     }
 }
 
@@ -1673,6 +1738,8 @@ struct InputReport {
     #[serde(default)]
     analysis_contract: AnalysisContract,
     root: String,
+    #[serde(default)]
+    scope: ReportScope,
     summary: InputSummary,
     coverage: InputCoverage,
     macro_opacity: InputMacroOpacity,
@@ -1826,6 +1893,7 @@ mod tests {
                 discovery: "multi-language-v1".to_owned(),
             },
             root: root.to_owned(),
+            scope: ReportScope::default(),
             summary: InputSummary {
                 burden: InputBurden {
                     production,
@@ -2022,6 +2090,7 @@ mod tests {
         let mut after = report("/after", 0, vec![file("src/lib.rs", vec![])], 0, 0);
         before.coverage.complete = false;
         after.model = "other-model".to_owned();
+        after.scope.language_filter = "python".to_owned();
 
         let error = compare_reports(
             Path::new("before.json"),
@@ -2034,6 +2103,7 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("score model differs"));
         assert!(message.contains("analyzed roots differ"));
+        assert!(message.contains("analysis scope policy differs"));
         assert!(message.contains("before coverage is incomplete"));
     }
 
@@ -2326,6 +2396,66 @@ mod tests {
     }
 
     #[test]
+    fn consolidates_ambiguity_warnings_by_match_stage() {
+        let ambiguous = |name: &str, body: &str| {
+            let mut function = function(name, 10, 0);
+            function.snapshot_id = format!("snapshot-{name}");
+            function.declaration_fingerprint = format!("declaration-{name}");
+            function.body_fingerprint = body.to_owned();
+            function
+        };
+        let before = report(
+            "/repo",
+            60,
+            vec![file(
+                "src/lib.rs",
+                vec![
+                    ambiguous("before-a-1", "body-a"),
+                    ambiguous("before-a-2", "body-a"),
+                    ambiguous("before-b-1", "body-b"),
+                    ambiguous("before-b-2", "body-b"),
+                    ambiguous("before-c-1", "body-c"),
+                    ambiguous("before-c-2", "body-c"),
+                ],
+            )],
+            0,
+            0,
+        );
+        let after = report(
+            "/repo",
+            60,
+            vec![file(
+                "src/lib.rs",
+                vec![
+                    ambiguous("after-a-1", "body-a"),
+                    ambiguous("after-a-2", "body-a"),
+                    ambiguous("after-b-1", "body-b"),
+                    ambiguous("after-b-2", "body-b"),
+                    ambiguous("after-c-1", "body-c"),
+                    ambiguous("after-c-2", "body-c"),
+                ],
+            )],
+            0,
+            0,
+        );
+        let comparison = compare_reports(
+            Path::new("before.json"),
+            Path::new("after.json"),
+            before,
+            after,
+            CompareOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(comparison.warnings.len(), 1);
+        assert!(comparison.warnings[0].contains("ambiguous body_fingerprint match stage"));
+        assert!(comparison.warnings[0].contains("3 candidate group(s)"));
+        assert!(comparison.warnings[0].contains("6 before and 6 after unit(s)"));
+        assert_eq!(comparison.functions.removed.len(), 6);
+        assert_eq!(comparison.functions.added.len(), 6);
+    }
+
+    #[test]
     fn lambda_insertion_does_not_remap_siblings() {
         let make_lambda = |name: &str, body: &str| {
             let mut function = lambda(name, 10);
@@ -2440,6 +2570,55 @@ mod tests {
             CompareOptions::default(),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("compact or non-analysis"));
+        assert!(error.to_string().contains("only complete analysis reports"));
+    }
+
+    #[test]
+    fn rejects_compact_reports_as_baselines() {
+        let mut compact = report(
+            "/repo",
+            10,
+            vec![file("src/lib.rs", vec![function("run", 10, 0)])],
+            0,
+            0,
+        );
+        compact.report_kind = "analysis_compact".to_owned();
+        let error = compare_reports(
+            Path::new("compact.json"),
+            Path::new("compact.json"),
+            compact.clone(),
+            compact,
+            CompareOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("only complete analysis reports"));
+    }
+
+    #[test]
+    fn rejects_reports_without_schema_version() {
+        let mut before = report(
+            "/repo",
+            10,
+            vec![file("src/lib.rs", vec![function("run", 10, 0)])],
+            0,
+            0,
+        );
+        before.schema_version = 0;
+        let after = report(
+            "/repo",
+            10,
+            vec![file("src/lib.rs", vec![function("run", 10, 0)])],
+            0,
+            0,
+        );
+        let error = compare_reports(
+            Path::new("before.json"),
+            Path::new("after.json"),
+            before,
+            after,
+            CompareOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("schema version is 0"));
     }
 }

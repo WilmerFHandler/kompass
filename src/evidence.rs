@@ -102,6 +102,10 @@ pub enum CallResolutionReason {
 /// Stable source reference to one reported callable.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct CallableRef {
+    /// Snapshot identity from the report's identity-v1 contract.  Names and
+    /// locations remain useful for display, while this field lets evidence
+    /// consumers join an edge or occurrence back to exactly one report unit.
+    pub snapshot_id: String,
     pub path: String,
     pub language: Language,
     pub category: Category,
@@ -247,6 +251,7 @@ fn collect_nodes(files: &[EvidenceFile]) -> BTreeMap<CallableKey, CallableNode> 
         for function in &file.functions {
             let key = callable_key(&file.path, file.language, function);
             let reference = CallableRef {
+                snapshot_id: function.snapshot_id.clone(),
                 path: file.path.clone(),
                 language: file.language,
                 category: function.category,
@@ -336,6 +341,7 @@ fn build_call_graph(
                             .is_some_and(|node| direct_target_kind(&node.reference.kind))
                     })
                     .collect::<Vec<_>>();
+                let candidates = lexical_candidates(&caller.reference.name, candidates);
                 match candidates.as_slice() {
                     [only] => (
                         CallResolution::Resolved,
@@ -416,6 +422,40 @@ fn build_call_graph(
     )
 }
 
+/// Keep direct-name resolution inside the nearest lexical scope that has a
+/// matching definition.  This is still source-only and conservative: a
+/// scope with multiple candidates remains ambiguous, while an unrelated
+/// nested definition cannot satisfy a top-level call merely because its leaf
+/// name matches.
+fn lexical_candidates(caller_name: &str, candidates: Vec<CallableKey>) -> Vec<CallableKey> {
+    let mut prefixes = Vec::new();
+    let mut prefix = caller_name;
+    loop {
+        prefixes.push(prefix);
+        let Some((parent, _)) = prefix.rsplit_once("::") else {
+            break;
+        };
+        prefix = parent;
+    }
+    prefixes.push("");
+
+    for prefix in prefixes {
+        let scoped = candidates
+            .iter()
+            .filter(|candidate| candidate_scope(&candidate.name) == prefix)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !scoped.is_empty() {
+            return scoped;
+        }
+    }
+    Vec::new()
+}
+
+fn candidate_scope(name: &str) -> &str {
+    name.rsplit_once("::").map_or("", |(scope, _)| scope)
+}
+
 fn direct_target_kind(kind: &FunctionKind) -> bool {
     matches!(kind, FunctionKind::Function | FunctionKind::NestedFunction)
 }
@@ -487,6 +527,25 @@ fn build_duplicates(
     files: &[EvidenceFile],
     nodes: &BTreeMap<CallableKey, CallableNode>,
 ) -> DuplicateEvidence {
+    let streams = collect_statement_streams(files, nodes);
+    let candidates = find_duplicate_candidates(&streams);
+    let accepted = maximal_sequences(candidates);
+    let mut groups = render_duplicate_groups(&accepted, &streams, nodes);
+    groups.sort_by(|left, right| {
+        right
+            .tokens
+            .cmp(&left.tokens)
+            .then_with(|| left.language.cmp(&right.language))
+            .then_with(|| left.category.cmp(&right.category))
+            .then_with(|| left.fingerprint.cmp(&right.fingerprint))
+    });
+    DuplicateEvidence { groups, omitted: 0 }
+}
+
+fn collect_statement_streams(
+    files: &[EvidenceFile],
+    nodes: &BTreeMap<CallableKey, CallableNode>,
+) -> Vec<StatementStream> {
     let mut streams =
         BTreeMap::<(String, Language, Category, LocalCallable, usize), StatementStream>::new();
     for file in files {
@@ -518,7 +577,17 @@ fn build_duplicates(
     for stream in &mut streams {
         stream.statements.sort_by_key(|statement| statement.ordinal);
     }
+    // No qualifying duplicate can contain fewer than three statements. Drop
+    // these streams before comparing pairs; generated code commonly contains
+    // thousands of one-line functions, and letting those empty candidates
+    // enter the quadratic comparison adds cost without producing evidence.
+    streams.retain(|stream| stream.statements.len() >= 3);
+    streams
+}
 
+fn find_duplicate_candidates(
+    streams: &[StatementStream],
+) -> BTreeMap<SequenceKey, BTreeSet<OccurrenceKey>> {
     let mut candidates = BTreeMap::<SequenceKey, BTreeSet<OccurrenceKey>>::new();
     for left_index in 0..streams.len() {
         for right_index in left_index..streams.len() {
@@ -577,7 +646,12 @@ fn build_duplicates(
             }
         }
     }
+    candidates
+}
 
+fn maximal_sequences(
+    candidates: BTreeMap<SequenceKey, BTreeSet<OccurrenceKey>>,
+) -> Vec<SequenceKey> {
     let mut candidate_keys = candidates.keys().cloned().collect::<Vec<_>>();
     candidate_keys.sort_by(|left, right| {
         right
@@ -597,7 +671,14 @@ fn build_duplicates(
         }
         accepted.push(candidate);
     }
+    accepted
+}
 
+fn render_duplicate_groups(
+    accepted: &[SequenceKey],
+    streams: &[StatementStream],
+    nodes: &BTreeMap<CallableKey, CallableNode>,
+) -> Vec<DuplicateGroup> {
     let mut groups = Vec::new();
     for key in accepted {
         let mut occurrences = BTreeSet::new();
@@ -657,15 +738,7 @@ fn build_duplicates(
             occurrences: rendered_occurrences,
         });
     }
-    groups.sort_by(|left, right| {
-        right
-            .tokens
-            .cmp(&left.tokens)
-            .then_with(|| left.language.cmp(&right.language))
-            .then_with(|| left.category.cmp(&right.category))
-            .then_with(|| left.fingerprint.cmp(&right.fingerprint))
-    });
-    DuplicateEvidence { groups, omitted: 0 }
+    groups
 }
 
 fn common_prefix(left: &[FrontendStatement], right: &[FrontendStatement]) -> usize {

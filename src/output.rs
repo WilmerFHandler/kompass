@@ -163,6 +163,17 @@ fn render_explain_text(explanation: &ExplainReport) -> String {
         explanation.total, explanation.coverage.analyzed_files
     )
     .unwrap();
+    let call_coverage = &explanation.evidence.call_graph.coverage;
+    writeln!(
+        output,
+        "Evidence · {} call sites · {} resolved · {} unresolved · {} ambiguous · {} duplicate groups",
+        call_coverage.call_sites,
+        call_coverage.resolved,
+        call_coverage.unresolved,
+        call_coverage.ambiguous,
+        explanation.evidence.duplicates.groups.len()
+    )
+    .unwrap();
     if explanation.candidates.is_empty() {
         writeln!(output, "No callable or initializer contains this line.").unwrap();
     }
@@ -204,7 +215,53 @@ fn render_explain_text(explanation: &ExplainReport) -> String {
             )
             .unwrap();
         }
-        writeln!(output, "  evidence · unavailable · syntax-only explanation").unwrap();
+        writeln!(
+            output,
+            "  evidence · {} relevant source-local records",
+            candidate.evidence.len()
+        )
+        .unwrap();
+        for evidence in &candidate.evidence {
+            match evidence {
+                crate::explain::ExplainEvidence::CallEdge { edge } => {
+                    writeln!(
+                        output,
+                        "    call · {} -> {} · {:?} · {}:{}",
+                        edge.caller.name,
+                        edge.callee_name,
+                        edge.resolution,
+                        edge.location.start.line,
+                        edge.location.start.column
+                    )
+                    .unwrap();
+                }
+                crate::explain::ExplainEvidence::CallRegion { region } => {
+                    writeln!(
+                        output,
+                        "    region · {} reachable units · {} burden · depth {}{}",
+                        region.unique_units,
+                        format_score(region.burden),
+                        region.max_depth,
+                        if region.recursive {
+                            " · recursive"
+                        } else {
+                            ""
+                        }
+                    )
+                    .unwrap();
+                }
+                crate::explain::ExplainEvidence::DuplicateGroup { group } => {
+                    writeln!(
+                        output,
+                        "    duplicate · {} statements · {} tokens · {} occurrences",
+                        group.statement_count,
+                        group.tokens,
+                        group.occurrences.len()
+                    )
+                    .unwrap();
+                }
+            }
+        }
     }
     output
 }
@@ -585,11 +642,13 @@ mod tests {
             model: SCORE_MODEL.to_owned(),
             analysis_contract: AnalysisContract::current(),
             root: "/tmp/project".to_owned(),
+            scope: Default::default(),
             summary: Summary {
                 files: 1,
                 code_lines: 4,
                 tokens: 12,
                 languages: Default::default(),
+                by_language: Default::default(),
                 production: CategorySummary {
                     functions: 1,
                     total_score: 50,
@@ -710,6 +769,7 @@ mod tests {
             model: SCORE_MODEL.to_owned(),
             analysis_contract: AnalysisContract::current(),
             root: "/tmp/project".to_owned(),
+            scope: Default::default(),
             summary: Summary {
                 files: 2,
                 production: CategorySummary {

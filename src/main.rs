@@ -28,7 +28,9 @@ Agent workflow:
 For custom automation, `summary.burden.production` is the production burden in
 integer tenths (143 means 14.3). Inspect `files[].burden`,
 `files[].functions[].score.value`, and `files[].functions[].metrics` for file
-and callable detail. `summary.languages` counts Rust and Python files, while
+and callable detail. `summary.languages` counts Rust and Python files, and
+`summary.by_language` contains their independent aggregates. `scope` records
+the selection, requested language filter, and category policy, while
 `analysis_contract` records the frontend and discovery contracts used.
 
 JSON is the agent interface: it includes every analyzed callable and initializer. `--top`,
@@ -52,11 +54,12 @@ view. It is marked `report_kind: "analysis_compact"` and retains full scope,
 coverage, and aggregate values alongside explicit `returned` and `total` counts.
 Use `kompass explain PATH --line N` to inspect every callable containing a line;
 the output marks the innermost candidate, shows all eight score components and
-their source locations, and reports semantic evidence as unavailable until that
-module exists.
+their source locations, and includes relevant source-only call, reachability,
+and duplicate evidence from the freshly analyzed report.
 
 `kompass diff BEFORE.json AFTER.json --format json --compact --top N` uses the
-same explicit truncation contract with `report_kind: "diff_compact"`.
+same explicit truncation contract with `report_kind: "diff_compact"` and retains
+the evidence contract version in its before and after metadata.
 
 Const and static initializers appear in `files[].functions[]` as callable-like
 `const_initializer` or `static_initializer` units. Their initializer
@@ -235,107 +238,63 @@ impl From<Sort> for SortBy {
 
 fn main() {
     let cli = Cli::parse();
-
-    if let Some(Command::Diff(args)) = cli.command.as_ref() {
-        let comparison = match diff::compare_paths_with_options(
-            &args.before,
-            &args.after,
-            diff::CompareOptions {
-                allow_file_changes: args.allow_file_changes,
-                allow_root_change: args.allow_root_change,
-            },
-        ) {
-            Ok(comparison) => comparison,
-            Err(error) => {
-                eprintln!("kompass: {error}");
-                std::process::exit(2);
-            }
-        };
-        let rendered = if args.compact {
-            match diff::render_compact_comparison(&comparison, args.format.into(), args.top) {
-                Ok(rendered) => rendered,
-                Err(error) => {
-                    eprintln!("kompass: could not render comparison: {error}");
-                    std::process::exit(2);
-                }
-            }
-        } else {
-            match diff::render_comparison(&comparison, args.format.into()) {
-                Ok(rendered) => rendered,
-                Err(error) => {
-                    eprintln!("kompass: could not render comparison: {error}");
-                    std::process::exit(2);
-                }
-            }
-        };
-        let mut stdout = io::BufWriter::new(io::stdout().lock());
-        match stdout
-            .write_all(rendered.as_bytes())
-            .and_then(|_| stdout.flush())
-        {
-            Ok(()) => return,
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return,
-            Err(error) => {
-                eprintln!("kompass: {error}");
-                std::process::exit(2);
-            }
-        }
-    }
-
-    if let Some(Command::Explain(args)) = cli.command.as_ref() {
-        let discovered =
-            match discover::discover_with_language(&args.path, discover::LanguageFilter::All) {
-                Ok(files) => files,
-                Err(error) => {
-                    eprintln!("kompass: {error}");
-                    std::process::exit(2);
-                }
-            };
-        let report = analyze::analyze(&args.path, discovered);
-        let explanation = match explain::explain_report(&report, &args.path, args.line) {
-            Ok(explanation) => explanation,
-            Err(error) => {
-                eprintln!("kompass: {error}");
-                std::process::exit(2);
-            }
-        };
-        let rendered = match output::render_explain(&explanation, args.format.into()) {
-            Ok(rendered) => rendered,
-            Err(error) => {
-                eprintln!("kompass: could not render explanation: {error}");
-                std::process::exit(2);
-            }
-        };
-        let mut stdout = io::BufWriter::new(io::stdout().lock());
-        match stdout
-            .write_all(rendered.as_bytes())
-            .and_then(|_| stdout.flush())
-        {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return,
-            Err(error) => {
-                eprintln!("kompass: {error}");
-                std::process::exit(2);
-            }
-        }
-        if report.has_errors() {
-            std::process::exit(2);
-        }
-        return;
-    }
-
-    if cli.compact && cli.format != Format::Json {
-        eprintln!("kompass: --compact requires --format json");
-        std::process::exit(2);
-    }
-
-    let discovered = match discover::discover_with_language(&cli.path, cli.language.into()) {
-        Ok(files) => files,
+    match run(&cli) {
+        Ok(false) => {}
+        Ok(true) => std::process::exit(2),
         Err(error) => {
             eprintln!("kompass: {error}");
             std::process::exit(2);
         }
-    };
+    }
+}
+
+fn run(cli: &Cli) -> Result<bool, String> {
+    match cli.command.as_ref() {
+        Some(Command::Diff(args)) => run_diff(args),
+        Some(Command::Explain(args)) => run_explain(args),
+        None => run_analysis(cli),
+    }
+}
+
+fn run_diff(args: &DiffArgs) -> Result<bool, String> {
+    let comparison = diff::compare_paths_with_options(
+        &args.before,
+        &args.after,
+        diff::CompareOptions {
+            allow_file_changes: args.allow_file_changes,
+            allow_root_change: args.allow_root_change,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let rendered = if args.compact {
+        diff::render_compact_comparison(&comparison, args.format.into(), args.top)
+    } else {
+        diff::render_comparison(&comparison, args.format.into())
+    }
+    .map_err(|error| format!("could not render comparison: {error}"))?;
+    write_stdout(&rendered)?;
+    Ok(false)
+}
+
+fn run_explain(args: &ExplainArgs) -> Result<bool, String> {
+    let discovered = discover::discover_with_language(&args.path, discover::LanguageFilter::All)
+        .map_err(|error| error.to_string())?;
+    let report = analyze::analyze(&args.path, discovered);
+    let explanation = explain::explain_report(&report, &args.path, args.line)
+        .map_err(|error| error.to_string())?;
+    let rendered = output::render_explain(&explanation, args.format.into())
+        .map_err(|error| format!("could not render explanation: {error}"))?;
+    write_stdout(&rendered)?;
+    Ok(report.has_errors())
+}
+
+fn run_analysis(cli: &Cli) -> Result<bool, String> {
+    if cli.compact && cli.format != Format::Json {
+        return Err("--compact requires --format json".to_owned());
+    }
+
+    let discovered = discover::discover_with_language(&cli.path, cli.language.into())
+        .map_err(|error| error.to_string())?;
 
     let report = analyze::analyze(&cli.path, discovered);
     let rendered = if cli.compact {
@@ -355,23 +314,20 @@ fn main() {
         )
         .map_err(|error| io::Error::other(format!("could not render report: {error}")))
     };
-    let result = rendered.and_then(|rendered| {
-        let mut stdout = io::BufWriter::new(io::stdout().lock());
-        stdout
-            .write_all(rendered.as_bytes())
-            .and_then(|_| stdout.flush())
-    });
-    match result {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return,
-        Err(error) => {
-            eprintln!("kompass: {error}");
-            std::process::exit(2);
-        }
-    }
+    let rendered = rendered.map_err(|error| error.to_string())?;
+    write_stdout(&rendered)?;
+    Ok(report.has_errors())
+}
 
-    if report.has_errors() {
-        std::process::exit(2);
+fn write_stdout(rendered: &str) -> Result<(), String> {
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    match stdout
+        .write_all(rendered.as_bytes())
+        .and_then(|_| stdout.flush())
+    {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error.to_string()),
     }
 }
 

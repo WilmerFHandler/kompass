@@ -33,6 +33,7 @@ pub struct Report {
     pub model: String,
     pub analysis_contract: AnalysisContract,
     pub root: String,
+    pub scope: ReportScope,
     pub summary: Summary,
     pub coverage: Coverage,
     pub macro_opacity: MacroOpacity,
@@ -42,6 +43,13 @@ pub struct Report {
     pub evidence: crate::evidence::Evidence,
     pub files: Vec<FileReport>,
     pub errors: Vec<AnalysisError>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReportScope {
+    pub selection: String,
+    pub language_filter: String,
+    pub category_policy: String,
 }
 
 impl Report {
@@ -56,9 +64,29 @@ pub struct Summary {
     pub code_lines: usize,
     pub tokens: usize,
     pub languages: LanguageCounts,
+    /// Complete aggregates partitioned by language. These reconcile with the
+    /// repository totals and let mixed-language consumers compare like with
+    /// like without rebuilding summaries from every callable.
+    pub by_language: LanguageSummaries,
     pub production: CategorySummary,
     pub test: CategorySummary,
     /// Sum of the exclusive callable units in every analyzed file.
+    pub burden: Burden,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct LanguageSummaries {
+    pub rust: LanguageSummary,
+    pub python: LanguageSummary,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct LanguageSummary {
+    pub files: usize,
+    pub code_lines: usize,
+    pub tokens: usize,
+    pub production: CategorySummary,
+    pub test: CategorySummary,
     pub burden: Burden,
 }
 

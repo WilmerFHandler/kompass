@@ -35,6 +35,8 @@ Production · 1 callables · total burden 1.3 · average 1.3 · p95 1.3 · highe
 Tests · 0 callables · total burden 0.0 · average 0.0 · p95 0.0 · highest 0.0
 Repository burden · 1.3 total · 1.3 production · 0.0 tests
 Macro opacity · 0 source invocations · 0 invocation source tokens · 0 definitions · 0 definition tokens · unexpanded and excluded from score
+Call evidence · 0 call sites · 0 resolved · 0 unresolved · 0 ambiguous · 0% resolved
+Duplicate evidence · 0 exact groups · showing 0 · 0 omitted · identifiers and literals preserved
 
 Files by burden · top 10
     1.3  1 callables · highest 1.3 · 1.3 production · 0.0 tests · Rust · README-example.rs
@@ -76,11 +78,13 @@ values while returning only the selected top entries. `returned` and `total` mak
 explicit, and `report_kind` distinguishes `analysis_compact` and `diff_compact` from full
 reports. Explain output is freshly analyzed for the requested source file and line; when
 several nested units contain the line, every candidate is returned and exactly one is marked
-`innermost`. Each candidate exposes all eight score components with source locations. Semantic
-evidence is currently represented by an explicit `unavailable` placeholder.
+`innermost`. Each candidate exposes all eight score components with source locations and the
+relevant source-only call, reachability, and duplicate evidence records.
 
 Every serialized view includes `schema_version` so consumers can reject incompatible envelopes
-before reading fields. Full analysis reports identify themselves with `report_kind: "analysis"`.
+before reading fields. Full analysis reports identify themselves with `report_kind: "analysis"`;
+`scope` records file/directory selection, the requested language filter, and the production/test
+policy rather than asking consumers to infer them from the result.
 
 ### Agent workflow
 
@@ -111,6 +115,7 @@ so `143` means `14.3`. The same report has separate `summary.burden.test` and
 `files[].functions[].score.value` is the exact callable score while
 `files[].functions[].metrics` explains its components. Production and test
 categories use the same score and have separate scores and summaries.
+`summary.by_language` carries the same complete aggregates for Rust and Python independently.
 
 JSON includes every analyzed callable and initializer, so `--top`, `--sort`,
 `--tests`, and `--all` affect text output only. Check `coverage` and `errors` before comparing

@@ -98,6 +98,13 @@ fn json_report_contains_separate_categories_and_tokens() {
     assert_eq!(report["model"], "structural-v4");
     assert_eq!(report["schema_version"], 2);
     assert_eq!(report["evidence_version"], "evidence-v1");
+    assert_eq!(report["evidence"]["contract"], "evidence-v1");
+    assert_eq!(report["scope"]["selection"], "directory");
+    assert_eq!(report["scope"]["language_filter"], "all");
+    assert_eq!(
+        report["scope"]["category_policy"],
+        "production-test-separated-v1"
+    );
     assert_eq!(report["analysis_contract"]["version"], "analysis-v1");
     assert_eq!(
         report["analysis_contract"]["discovery"],
@@ -106,6 +113,11 @@ fn json_report_contains_separate_categories_and_tokens() {
     assert_eq!(report["files"][0]["language"], "rust");
     assert_eq!(report["summary"]["languages"]["rust"], 1);
     assert_eq!(report["summary"]["languages"]["python"], 0);
+    assert_eq!(report["summary"]["by_language"]["rust"]["files"], 1);
+    assert_eq!(
+        report["summary"]["by_language"]["rust"]["burden"],
+        report["summary"]["burden"]
+    );
     assert_eq!(report["summary"]["production"]["functions"], 1);
     assert_eq!(report["summary"]["test"]["functions"], 1);
     assert_eq!(report["files"][0]["functions"][0]["category"], "production");
@@ -315,6 +327,7 @@ fn compact_json_is_explicitly_truncated_and_retains_aggregates() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["report_kind"], "analysis_compact");
     assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["evidence_version"], "evidence-v1");
     assert_eq!(value["returned"], 1);
     assert_eq!(value["total"], 2);
     assert!(value["scope"].is_object());
@@ -351,6 +364,8 @@ fn explain_reports_all_containing_candidates_and_marks_innermost() {
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["report_kind"], "explain");
+    assert_eq!(value["evidence_version"], "evidence-v1");
+    assert_eq!(value["evidence"]["contract"], "evidence-v1");
     assert_eq!(value["scope"]["line"], 3);
     let candidates = value["candidates"].as_array().unwrap();
     assert!(candidates.len() >= 2);
@@ -363,7 +378,8 @@ fn explain_reports_all_containing_candidates_and_marks_innermost() {
     );
     for candidate in candidates {
         assert_eq!(candidate["components"].as_array().unwrap().len(), 8);
-        assert!(candidate["evidence"].is_array());
+        let evidence = candidate["evidence"].as_array().unwrap();
+        assert!(evidence.iter().all(|item| item["kind"] != "unavailable"));
     }
 
     std::fs::remove_dir_all(root).unwrap();
