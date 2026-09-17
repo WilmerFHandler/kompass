@@ -220,6 +220,15 @@ filters, and exception handlers. A `with` item is an expression operation, not
 a decision. Assignment, augmented assignment, deletion, and walrus expressions
 are also exposed as mutation signals.
 
+JavaScript and TypeScript report functions, methods, nested functions, arrow
+functions, callbacks, and executable module or class initializers as exclusive
+units. JSX markup adds no structural cost, while JavaScript expressions inside
+JSX are measured normally. Type annotations and other erased TypeScript syntax
+do not affect structural metrics. `if`, loops, conditional expressions, and
+exception handlers are control decisions; `&&`, `||`, `??`, and one boundary
+per optional chain are boolean decisions; switch cases are match arms. A module
+made entirely of callable declarations has no separate initializer tax.
+
 Across all supported languages, `call_sites` counts ordinary and method calls,
 `explicit_parameters` excludes a method receiver, and `match_arms` counts every
 arm or case. Direct Python methods exclude a leading `self` or `cls` unless the

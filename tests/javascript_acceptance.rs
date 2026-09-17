@@ -233,7 +233,6 @@ fn fixture_corpus_covers_the_requested_surfaces() {
 }
 
 #[test]
-#[ignore = "requires JavaScript/TypeScript frontend integration"]
 fn all_four_extensions_are_discovered_and_scored() {
     let root = temporary_directory("extensions");
     fs::create_dir_all(&root).unwrap();
@@ -275,7 +274,6 @@ fn all_four_extensions_are_discovered_and_scored() {
 }
 
 #[test]
-#[ignore = "requires JavaScript/TypeScript frontend integration"]
 fn react_components_hooks_and_jsx_callbacks_are_exclusive_units() {
     let root = temporary_directory("react-surface");
     fs::create_dir_all(&root).unwrap();
@@ -286,14 +284,14 @@ fn react_components_hooks_and_jsx_callbacks_are_exclusive_units() {
 
     let component = function_named(&report, "ListScreen");
     assert_eq!(component["kind"], "function");
-    assert!(component["metrics"]["control_decisions"].as_u64().unwrap() >= 2);
+    assert!(component["metrics"]["decisions"].as_u64().unwrap() >= 2);
     let hook = function_named(&report, "useVisibleItems");
     assert!(matches!(
         hook["kind"].as_str(),
         Some("closure" | "lambda" | "function")
     ));
-    assert!(hook["metrics"]["expression_operations"].as_u64().unwrap() > 0);
-    let render_item = function_named(&report, "renderItem");
+    assert!(hook["metrics"]["call_sites"].as_u64().unwrap() > 0);
+    let render_item = function_named(&report, "ListScreen::renderItem");
     assert!(
         render_item["metrics"]["control_decisions"]
             .as_u64()
@@ -322,7 +320,6 @@ fn react_components_hooks_and_jsx_callbacks_are_exclusive_units() {
 }
 
 #[test]
-#[ignore = "requires JavaScript/TypeScript frontend integration"]
 fn nested_callback_bodies_do_not_leak_into_outer_scores() {
     let base_root = temporary_directory("callback-base");
     let nested_root = temporary_directory("callback-nested");
@@ -383,7 +380,6 @@ fn nested_callback_bodies_do_not_leak_into_outer_scores() {
 }
 
 #[test]
-#[ignore = "requires JavaScript/TypeScript frontend integration"]
 fn modern_js_control_flow_remains_visible_to_structural_v4() {
     let root = temporary_directory("control-flow");
     fs::create_dir_all(&root).unwrap();
@@ -403,13 +399,13 @@ fn modern_js_control_flow_remains_visible_to_structural_v4() {
         assert_score_reconciles(function);
     }
     assert!(
-        function_named(&report, "optional")["metrics"]["expression_operations"]
+        function_named(&report, "optional")["metrics"]["decisions"]
             .as_u64()
             .unwrap()
             > 0
     );
     assert!(
-        function_named(&report, "nullish")["metrics"]["expression_operations"]
+        function_named(&report, "nullish")["metrics"]["decisions"]
             .as_u64()
             .unwrap()
             > 0
@@ -437,7 +433,6 @@ fn modern_js_control_flow_remains_visible_to_structural_v4() {
 }
 
 #[test]
-#[ignore = "requires JavaScript/TypeScript frontend integration"]
 fn module_and_class_initializers_are_reported_once() {
     let root = temporary_directory("initializers");
     fs::create_dir_all(&root).unwrap();
@@ -488,7 +483,6 @@ fn module_and_class_initializers_are_reported_once() {
 }
 
 #[test]
-#[ignore = "requires JavaScript/TypeScript frontend integration"]
 fn anonymous_and_default_exports_remain_callable_units() {
     let root = temporary_directory("anonymous-default");
     fs::create_dir_all(&root).unwrap();
@@ -518,7 +512,6 @@ fn anonymous_and_default_exports_remain_callable_units() {
 }
 
 #[test]
-#[ignore = "requires JavaScript/TypeScript frontend integration"]
 fn type_annotations_and_assertions_are_score_invariant() {
     let js_root = temporary_directory("type-erasure-js");
     let ts_root = temporary_directory("type-erasure-ts");
@@ -552,7 +545,6 @@ fn type_annotations_and_assertions_are_score_invariant() {
 }
 
 #[test]
-#[ignore = "requires JavaScript/TypeScript frontend integration"]
 fn malformed_typescript_is_a_partial_report_with_valid_siblings() {
     let root = temporary_directory("malformed");
     fs::create_dir_all(&root).unwrap();
@@ -584,7 +576,6 @@ fn malformed_typescript_is_a_partial_report_with_valid_siblings() {
 }
 
 #[test]
-#[ignore = "requires JavaScript/TypeScript frontend integration"]
 fn mixed_scope_classifies_tests_and_excludes_generated_dependencies() {
     let root = temporary_directory("scope");
     fs::create_dir_all(&root).unwrap();
@@ -653,7 +644,6 @@ fn mixed_scope_classifies_tests_and_excludes_generated_dependencies() {
 }
 
 #[test]
-#[ignore = "requires JavaScript/TypeScript frontend integration"]
 fn duplicate_names_keep_distinct_ids_and_evidence_contract() {
     let root = temporary_directory("duplicates");
     fs::create_dir_all(&root).unwrap();
@@ -712,7 +702,6 @@ fn duplicate_names_keep_distinct_ids_and_evidence_contract() {
 }
 
 #[test]
-#[ignore = "requires JavaScript/TypeScript frontend integration"]
 fn explain_preserves_eight_components_for_jsx_callback_lines() {
     let root = temporary_directory("explain");
     fs::create_dir_all(&root).unwrap();
@@ -763,7 +752,6 @@ fn explain_preserves_eight_components_for_jsx_callback_lines() {
 }
 
 #[test]
-#[ignore = "requires JavaScript/TypeScript frontend integration"]
 fn diff_keeps_structural_and_analysis_contracts_for_tsx_changes() {
     let root = temporary_directory("diff");
     fs::create_dir_all(&root).unwrap();
@@ -813,10 +801,12 @@ fn diff_keeps_structural_and_analysis_contracts_for_tsx_changes() {
     assert_success(&comparison);
     let diff: Value = serde_json::from_slice(&comparison.stdout).unwrap();
     assert_eq!(diff["comparable"], true);
-    assert_eq!(diff["model"], "structural-v4");
-    assert_eq!(diff["evidence_version"], "evidence-v1");
+    assert_eq!(diff["before"]["model"], "structural-v4");
+    assert_eq!(diff["after"]["model"], "structural-v4");
+    assert_eq!(diff["before"]["evidence_version"], "evidence-v1");
+    assert_eq!(diff["after"]["evidence_version"], "evidence-v1");
     assert_eq!(
-        diff["analysis_contract"],
+        diff["before"]["analysis_contract"],
         before_report["analysis_contract"]
     );
     assert!(!diff["functions"]["changed"].as_array().unwrap().is_empty());

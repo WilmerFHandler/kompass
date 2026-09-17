@@ -667,6 +667,12 @@ impl<'ast> VisitJs<'ast> for MetricsCollector {
                 self.visit_expression(&node.left);
                 self.visit_expression(&node.right);
             }
+            // Optional chaining short-circuits at runtime. Charge one decision
+            // for the complete chain rather than one for every optional link.
+            Expression::ChainExpression(node) => {
+                self.boolean(node.span);
+                walk_js::walk_chain_expression(self, node);
+            }
             Expression::ConditionalExpression(node) => {
                 self.branch(node.span);
                 self.visit_expression(&node.test);
@@ -735,6 +741,16 @@ impl<'ast> VisitJs<'ast> for MetricsCollector {
         self.metrics.closures += 1;
     }
 
+    // Chain elements reach this visitor method directly instead of passing
+    // through `visit_expression`, so optional calls need their call-site cost
+    // recorded here.
+    fn visit_call_expression(&mut self, node: &CallExpression<'ast>) {
+        self.metrics.call_sites += 1;
+        self.add(ScoreComponent::CallSites, 2, node.span);
+        self.visit_expression(&node.callee);
+        self.visit_arguments(&node.arguments);
+    }
+
     fn visit_function(&mut self, _node: &Function<'ast>, _flags: ScopeFlags) {
         self.metrics.closures += 1;
     }
@@ -764,11 +780,7 @@ impl DiscoveryWalker<'_> {
     fn collect_module(&mut self, program: &Program<'_>) {
         let full = Span::new(0, self.source.len() as u32);
         let (metrics, pending) = metrics_for_statements(&program.body, self.line_map, full, 0, 0);
-        let has_work = metrics.statements > 0
-            || metrics.expression_operations > 0
-            || metrics.call_sites > 0
-            || metrics.boolean_operators > 0
-            || metrics.control_decisions > 0;
+        let has_work = program.body.iter().any(module_statement_has_runtime_work);
         if has_work {
             let body = program
                 .body
@@ -1050,48 +1062,22 @@ impl DiscoveryWalker<'_> {
 
         for element in &class.body.body {
             match element {
-                ClassElement::PropertyDefinition(property) => {
-                    if property.computed {
-                        self.visit_property_key(&property.key);
-                        if let Some(expression) = property.key.as_expression() {
-                            add_expression_metrics(
-                                expression,
-                                &mut metrics,
-                                &mut pending,
-                                self.line_map,
-                                self.depth,
-                            );
-                        }
-                    }
-                    for decorator in &property.decorators {
-                        self.visit_expression(&decorator.expression);
-                    }
-                    if let Some(value) = &property.value {
-                        metrics.statements += 1;
-                        measure_into(value, &mut metrics, &mut pending, self.line_map, self.depth);
-                    }
-                }
-                ClassElement::AccessorProperty(property) => {
-                    if property.computed {
-                        self.visit_property_key(&property.key);
-                        if let Some(expression) = property.key.as_expression() {
-                            add_expression_metrics(
-                                expression,
-                                &mut metrics,
-                                &mut pending,
-                                self.line_map,
-                                self.depth,
-                            );
-                        }
-                    }
-                    for decorator in &property.decorators {
-                        self.visit_expression(&decorator.expression);
-                    }
-                    if let Some(value) = &property.value {
-                        metrics.statements += 1;
-                        measure_into(value, &mut metrics, &mut pending, self.line_map, self.depth);
-                    }
-                }
+                ClassElement::PropertyDefinition(property) => self.collect_class_property(
+                    &property.key,
+                    property.computed,
+                    &property.decorators,
+                    property.value.as_ref(),
+                    &mut metrics,
+                    &mut pending,
+                ),
+                ClassElement::AccessorProperty(property) => self.collect_class_property(
+                    &property.key,
+                    property.computed,
+                    &property.decorators,
+                    property.value.as_ref(),
+                    &mut metrics,
+                    &mut pending,
+                ),
                 ClassElement::StaticBlock(block) => {
                     metrics.statements += block.body.len();
                     let (block_metrics, block_pending) = metrics_for_statements(
@@ -1144,6 +1130,30 @@ impl DiscoveryWalker<'_> {
         }
     }
 
+    fn collect_class_property(
+        &mut self,
+        key: &PropertyKey<'_>,
+        computed: bool,
+        decorators: &[Decorator<'_>],
+        value: Option<&Expression<'_>>,
+        metrics: &mut Metrics,
+        pending: &mut Vec<PendingContribution>,
+    ) {
+        if computed {
+            self.visit_property_key(key);
+            if let Some(expression) = key.as_expression() {
+                add_expression_metrics(expression, metrics, pending, self.line_map, self.depth);
+            }
+        }
+        for decorator in decorators {
+            self.visit_expression(&decorator.expression);
+        }
+        if let Some(value) = value {
+            metrics.statements += 1;
+            measure_into(value, metrics, pending, self.line_map, self.depth);
+        }
+    }
+
     fn collect_method(&mut self, method: &MethodDefinition<'_>) {
         let Some(body) = method.value.body.as_deref() else {
             return;
@@ -1180,6 +1190,86 @@ impl DiscoveryWalker<'_> {
             functions: &mut *self.functions,
         };
         nested.visit_body(&body.statements);
+    }
+}
+
+/// A module containing only callable declarations has no separate
+/// initialization unit. The callables already own their bodies, and charging
+/// their declarations again would make arrow-heavy React modules look more
+/// complex than equivalent function-declaration modules.
+fn module_statement_has_runtime_work(statement: &Statement<'_>) -> bool {
+    match statement {
+        Statement::FunctionDeclaration(_)
+        | Statement::ClassDeclaration(_)
+        | Statement::ImportDeclaration(_)
+        | Statement::ExportNamedDeclaration(_)
+        | Statement::ExportFromDeclaration(_)
+        | Statement::ExportAllDeclaration(_)
+        | Statement::TSTypeAliasDeclaration(_)
+        | Statement::TSInterfaceDeclaration(_)
+        | Statement::TSEnumDeclaration(_)
+        | Statement::TSModuleDeclaration(_)
+        | Statement::TSGlobalDeclaration(_)
+        | Statement::TSImportEqualsDeclaration(_)
+        | Statement::EmptyStatement(_) => false,
+        Statement::VariableDeclaration(declaration) => {
+            variable_declaration_has_runtime_work(declaration)
+        }
+        Statement::ExportDeclaration(export) => declaration_has_runtime_work(&export.declaration),
+        Statement::ExportDefaultDeclaration(export) => !matches!(
+            &export.declaration,
+            ExportDefaultDeclarationKind::FunctionDeclaration(_)
+                | ExportDefaultDeclarationKind::ClassDeclaration(_)
+                | ExportDefaultDeclarationKind::TSInterfaceDeclaration(_)
+        ),
+        _ => true,
+    }
+}
+
+fn declaration_has_runtime_work(declaration: &Declaration<'_>) -> bool {
+    match declaration {
+        Declaration::VariableDeclaration(declaration) => {
+            variable_declaration_has_runtime_work(declaration)
+        }
+        Declaration::FunctionDeclaration(_)
+        | Declaration::ClassDeclaration(_)
+        | Declaration::TSTypeAliasDeclaration(_)
+        | Declaration::TSInterfaceDeclaration(_)
+        | Declaration::TSEnumDeclaration(_)
+        | Declaration::TSModuleDeclaration(_)
+        | Declaration::TSGlobalDeclaration(_)
+        | Declaration::TSImportEqualsDeclaration(_) => false,
+    }
+}
+
+fn variable_declaration_has_runtime_work(declaration: &VariableDeclaration<'_>) -> bool {
+    declaration
+        .declarations
+        .iter()
+        .filter_map(|declarator| declarator.init.as_ref())
+        .any(|expression| !is_callable_initializer(expression))
+}
+
+fn is_callable_initializer(expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::ArrowFunctionExpression(_)
+        | Expression::FunctionExpression(_)
+        | Expression::ClassExpression(_) => true,
+        Expression::ParenthesizedExpression(expression) => {
+            is_callable_initializer(&expression.expression)
+        }
+        Expression::TSAsExpression(expression) => is_callable_initializer(&expression.expression),
+        Expression::TSSatisfiesExpression(expression) => {
+            is_callable_initializer(&expression.expression)
+        }
+        Expression::TSTypeAssertion(expression) => is_callable_initializer(&expression.expression),
+        Expression::TSNonNullExpression(expression) => {
+            is_callable_initializer(&expression.expression)
+        }
+        Expression::TSInstantiationExpression(expression) => {
+            is_callable_initializer(&expression.expression)
+        }
+        _ => false,
     }
 }
 
