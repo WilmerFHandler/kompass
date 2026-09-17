@@ -28,11 +28,22 @@ use crate::tokens::{self, LexedSource, TokenPosition};
 pub type PythonAnalyzer =
     fn(path: &Path, source: &str, category: Category) -> Result<FileAnalysis, String>;
 
+/// Callback contract for the JavaScript/TypeScript frontend. The frontend
+/// owns parsing and metric collection; the analyzer owns path/category
+/// metadata and aggregate reporting.
+pub type JavaScriptAnalyzer =
+    fn(path: &Path, source: &str, category: Category) -> Result<FileAnalysis, String>;
+
 /// Analyze each discovered source file independently. A file that cannot be
 /// read, lexed, or parsed is recorded as an error while successful files still
 /// produce a useful partial report.
 pub fn analyze(input: &Path, discovered: Discovery) -> Report {
-    analyze_with_frontends(input, discovered, Some(crate::python::analyze_file))
+    analyze_with_frontends_and_javascript(
+        input,
+        discovered,
+        Some(crate::python::analyze_file),
+        Some(crate::javascript::analyze_file),
+    )
 }
 
 /// Analyze each discovered file with an optional Python frontend. Keeping the
@@ -40,8 +51,20 @@ pub fn analyze(input: &Path, discovered: Discovery) -> Report {
 /// coupling discovery, reporting, or the Rust frontend to its AST types.
 pub fn analyze_with_frontends(
     input: &Path,
+    discovered: Discovery,
+    python_analyzer: Option<PythonAnalyzer>,
+) -> Report {
+    analyze_with_frontends_and_javascript(input, discovered, python_analyzer, None)
+}
+
+/// Analyze each discovered file with optional language frontends. Keeping the
+/// callbacks at this seam lets each parser evolve without coupling discovery,
+/// reporting, or the Rust frontend to foreign AST types.
+pub fn analyze_with_frontends_and_javascript(
+    input: &Path,
     mut discovered: Discovery,
     python_analyzer: Option<PythonAnalyzer>,
+    javascript_analyzer: Option<JavaScriptAnalyzer>,
 ) -> Report {
     let scope = ReportScope {
         selection: if discovered.explicit_file {
@@ -127,16 +150,21 @@ pub fn analyze_with_frontends(
                             .to_owned(),
                 }),
             },
-            // The JavaScript/TypeScript frontend is supplied at this seam by
-            // the Oxc implementation. Keeping an explicit unavailable result
-            // here lets discovery and report work compile independently while
-            // that frontend evolves.
-            Language::JavaScript | Language::TypeScript => Err(AnalysisError {
-                path: None,
-                kind: ErrorKind::Parse,
-                message: "JavaScript/TypeScript frontend is unavailable; build Kompass with the JavaScript frontend"
-                    .to_owned(),
-            }),
+            Language::JavaScript | Language::TypeScript => match javascript_analyzer {
+                Some(analyzer) => {
+                    analyzer(&path, &source, category).map_err(|message| AnalysisError {
+                        path: None,
+                        kind: ErrorKind::Parse,
+                        message,
+                    })
+                }
+                None => Err(AnalysisError {
+                    path: None,
+                    kind: ErrorKind::Parse,
+                    message: "JavaScript/TypeScript frontend is unavailable; build Kompass with the Oxc frontend"
+                        .to_owned(),
+                }),
+            },
         };
         let file_analysis = match file_analysis {
             Ok(file_analysis) => file_analysis,

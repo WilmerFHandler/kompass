@@ -147,6 +147,8 @@ fn canonical_tokens(source: &str, language: Language) -> Vec<u8> {
         let start = index;
         if let Some(end) = raw_literal_end(bytes, index, language) {
             index = end;
+        } else if language == Language::JavaScript && bytes[index] == b'`' {
+            index = template_literal_end(bytes, index);
         } else if let Some(end) = quoted_literal_end(bytes, index, language) {
             index = end;
         } else if is_identifier_byte(bytes[index]) {
@@ -235,6 +237,22 @@ fn quoted_literal_end(bytes: &[u8], start: usize, language: Language) -> Option<
         }
     }
     Some(bytes.len())
+}
+
+fn template_literal_end(bytes: &[u8], start: usize) -> usize {
+    let mut index = start.saturating_add(1);
+    let mut escaped = false;
+    while index < bytes.len() {
+        if escaped {
+            escaped = false;
+        } else if bytes[index] == b'\\' {
+            escaped = true;
+        } else if bytes[index] == b'`' {
+            return index.saturating_add(1);
+        }
+        index += 1;
+    }
+    bytes.len()
 }
 
 fn raw_literal_end(bytes: &[u8], start: usize, language: Language) -> Option<usize> {

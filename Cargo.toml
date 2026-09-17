@@ -7,6 +7,13 @@ rust-version = "1.95"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 ignore = "0.4"
+oxc_allocator = "=0.143.0"
+oxc_ast = "=0.143.0"
+oxc_ast_visit = "=0.143.0"
+oxc_parser = "=0.143.0"
+oxc_diagnostics = "=0.143.0"
+oxc_syntax = "=0.143.0"
+oxc_span = "=0.143.0"
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
 ruff_python_ast = "=0.0.10"
 ruff_python_parser = "=0.0.10"

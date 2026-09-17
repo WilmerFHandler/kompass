@@ -7,6 +7,7 @@ pub mod discover;
 pub mod evidence;
 pub mod explain;
 pub mod identity;
+pub mod javascript;
 pub mod model;
 pub mod output;
 pub mod python;
